@@ -3,7 +3,7 @@
 This guide provides instructions for launching and executing **DeepCORO-CLIP** on on-demand GPU instances via Vast.ai.
 
 Container Image: `ghcr.io/medstats/deepcoro-clip-docker:latest`  
-Vast.ai Template: **`DeepCORO-CLIP-GPU`**
+Vast.ai Template: **`DeepCORO-CLIP-GPU`** (Template ID: `800873`)
 
 ---
 

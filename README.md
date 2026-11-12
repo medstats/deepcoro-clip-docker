@@ -3,7 +3,7 @@
 A production-grade, GPU-accelerated Docker container for automated **invasive X-ray coronary angiography interpretation**, integrating **DeepCORO-CLIP multiview attention foundation models** and **VasoVision preprocessing**.
 
 * Container Registry: `ghcr.io/medstats/deepcoro-clip-docker:latest`
-* Vast.ai Template: **`DeepCORO-CLIP-GPU`**
+* Vast.ai Template: **`DeepCORO-CLIP-GPU`** (Template ID: `800873`)
 * GitHub Repository: [`medstats/deepcoro-clip-docker`](https://github.com/medstats/deepcoro-clip-docker)
 * Checkpoint: `zcb8cu0l_20260213-033432/best_model_epoch_11.pt` (`heartwise/deepcoro_clip_generic`)
 * Checkpoint SHA256: `4eac7676bc24930466d84f04f813fcbc1b9e70b056232cad603f18c84d008267`
