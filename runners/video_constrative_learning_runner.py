@@ -1,0 +1,1853 @@
+import os
+import pandas as pd
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Optimizer
+from torch.amp import GradScaler
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LRScheduler
+from typing import Callable, Dict, Tuple, List, Any, Optional, Set
+
+from tqdm import tqdm
+
+from utils.enums import RunMode
+from utils.ddp import DistributedUtils
+from utils.config.clip_config import ClipConfig
+from utils.registry import RunnerRegistry
+from utils.retrieval_metrics import (
+    compute_mrr,
+    compute_map,
+    compute_ndcg_at_k,
+    compute_median_rank,
+    compute_recall_at_k,
+    compute_embedding_norms,
+    compute_alignment_score,
+)
+from utils.wandb_logger import (
+    log_best_worst_retrievals,
+    log_gradient_norms,
+    save_retrieval_results,
+)
+from utils.loss.typing import Loss
+from utils.loss.weighted_siglip import WeightedSigLIPLoss
+from utils.wandb_wrapper import WandbWrapper
+from utils.retrieval_inference import resolve_inference_device, run_retrieval_metadata_inference
+from models.video_encoder import VideoEncoder
+from models.text_encoder import TextEncoder
+from dataloaders.video_clip_dataset import VideoClipDataset
+import itertools
+from torch.nn.utils import clip_grad_norm_
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+@RunnerRegistry.register("DeepCORO_clip")
+@RunnerRegistry.register("DeepCORO_clip_test")
+class VideoContrastiveLearningRunner:
+    """
+    This class runs a video contrastive learning pipeline using a VideoEncoder and TextEncoder.
+    It handles both training and validation loops in a distributed data-parallel setting.
+    """
+    def __init__(
+        self,
+        config: ClipConfig = None,
+        wandb_wrapper: WandbWrapper = None,
+        train_loader: DataLoader = None,
+        val_loader: DataLoader = None,
+        video_encoder: VideoEncoder = None,
+        text_encoder: TextEncoder = None,
+        optimizer: Optimizer = None,
+        scaler: GradScaler = None,
+        log_temp: torch.Tensor = None,
+        lr_scheduler: LRScheduler = None,
+        loss_fn: Loss = None,
+        output_dir: str = None,
+    ):
+        """
+        Initialize the runner with provided configurations, data loaders, and modules.
+
+        :param config: ClipConfig object with run/training configuration.
+        :param wandb_wrapper: WandbWrapper instance.
+        :param train_loader: DataLoader for training dataset.
+        :param val_loader: DataLoader for validation dataset.
+        :param video_encoder: VideoEncoder model.
+        :param text_encoder: TextEncoder model.
+        :param optimizer: optimizer instance.
+        :param scheduler: Learning rate scheduler.
+        :param scaler: GradScaler for automatic mixed precision.
+        :param log_temp: Logarithm of temperature used in contrastive loss.
+        :param lr_scheduler: Learning rate scheduler.
+        :param loss_fn: Contrastive loss function callable.
+        :param output_dir: Directory where checkpoints and outputs will be saved.
+        :raises ValueError: If recall_k or ndcg_k are not lists of ints.
+        """
+        if not isinstance(config.recall_k, list):
+            raise ValueError(
+                f"config.recall_k must be a list of ints, got {type(config.recall_k)}"
+            )
+        if not isinstance(config.ndcg_k, list):
+            raise ValueError(
+                f"config.ndcg_k must be a list of ints, got {type(config.ndcg_k)}"
+            )
+
+        self.config: ClipConfig = config
+        self.wandb_wrapper: WandbWrapper = wandb_wrapper
+        self.device: int = config.device
+        self.world_size: int = config.world_size
+        self.train_loader: DataLoader = train_loader
+        self.val_loader: DataLoader = val_loader
+        self.video_encoder: VideoEncoder = video_encoder
+        self.text_encoder: TextEncoder = text_encoder
+        self.optimizer: Optimizer = optimizer
+        self.scaler: GradScaler = scaler
+        self.lr_scheduler: LRScheduler = lr_scheduler
+        self.loss_fn: Loss = loss_fn
+        self.output_dir: str = output_dir
+        self.best_val_loss: float = float("inf")
+        self.best_epoch: int = -1
+        self.highest_alignment_score: float = float("-inf")
+        self.highest_alignment_epoch: int = -1
+        self.log_temp: torch.Tensor = log_temp
+        self.step: int = 0  # Initialize step counter for gradient accumulation
+
+        # For simplicity: check the config for a known scheduler_name
+        # If it includes "_warmup" or is from HF, we treat it as per-iteration
+        self.scheduler_per_iteration = self._scheduler_is_per_iteration()
+        
+        # Store initial temperature for scheduling
+        self.initial_log_temp = log_temp.clone() if log_temp is not None else torch.log(torch.tensor(config.temperature))
+        self.use_weighted_siglip: bool = bool(getattr(self.config, "siglip_use_weighted_loss", False))
+        self.weighted_siglip_loss = WeightedSigLIPLoss() if self.use_weighted_siglip else None
+        self.siglip_abnormal_margin: float = float(getattr(self.config, "siglip_abnormal_margin", 0.0))
+        
+    def _should_debug_batch(self) -> bool:
+        debug_batches = max(0, getattr(self.config, 'siglip_debug_batches', 0))
+        debug_every = max(0, getattr(self.config, 'siglip_debug_every', 0))
+        if debug_batches > 0 and self.step < debug_batches:
+            return True
+        if debug_every > 0 and debug_batches == 0 and self.step > 0 and (self.step % debug_every == 0):
+            return True
+        return False
+
+    @staticmethod
+    def _collect_grad_norms(param_groups: List[dict]) -> Dict[str, float]:
+        grad_norms: Dict[str, float] = {}
+        for idx, group in enumerate(param_groups):
+            total = 0.0
+            for param in group.get('params', []):
+                if param is None or param.grad is None:
+                    continue
+                grad = param.grad.detach()
+                total += float(torch.sum(grad * grad))
+            name = group.get('name', f'group_{idx}')
+            grad_norms[name] = float(total ** 0.5) if total > 0 else 0.0
+        return grad_norms
+
+    def _compute_temperature_schedule(self, epoch: int) -> float:
+        """
+        Compute scheduled temperature for current epoch.
+        
+        Args:
+            epoch: Current epoch number (0-indexed)
+            
+        Returns:
+            Scheduled temperature value
+        """
+        schedule_type = getattr(self.config, "temperature_schedule", "constant")
+        temp_start = getattr(self.config, "temperature_start", self.config.temperature)
+        temp_end = getattr(self.config, "temperature_end", self.config.temperature)
+        warmup_epochs = getattr(self.config, "temperature_warmup_epochs", 0)
+        
+        if schedule_type == "constant" or warmup_epochs <= 0:
+            return self.config.temperature
+        
+        if epoch >= warmup_epochs:
+            return temp_end
+        
+        progress = epoch / warmup_epochs
+        
+        if schedule_type == "linear":
+            return temp_start + (temp_end - temp_start) * progress
+        elif schedule_type == "cosine":
+            # Cosine annealing from start to end
+            cosine_factor = (1 - math.cos(progress * math.pi)) / 2
+            return temp_start + (temp_end - temp_start) * cosine_factor
+        elif schedule_type == "exponential":
+            # Exponential decay
+            decay_rate = math.log(temp_end / temp_start) / warmup_epochs
+            return temp_start * math.exp(decay_rate * epoch)
+        else:
+            return self.config.temperature
+    
+    def _compute_freeze_schedule(self, epoch: int) -> float:
+        """
+        Compute scheduled video freeze ratio for current epoch.
+        
+        Args:
+            epoch: Current epoch number (0-indexed)
+            
+        Returns:
+            Scheduled freeze ratio (1.0 = all frozen, 0.0 = all trainable)
+        """
+        schedule_type = getattr(self.config, "video_freeze_schedule", "constant")
+        freeze_start = getattr(self.config, "video_freeze_start", self.config.video_freeze_ratio)
+        freeze_end = getattr(self.config, "video_freeze_end", self.config.video_freeze_ratio)
+        warmup_epochs = getattr(self.config, "video_freeze_warmup_epochs", 0)
+        
+        if schedule_type == "constant" or warmup_epochs <= 0:
+            return self.config.video_freeze_ratio
+        
+        if epoch >= warmup_epochs:
+            return freeze_end
+        
+        progress = epoch / warmup_epochs
+        
+        if schedule_type == "linear":
+            return freeze_start + (freeze_end - freeze_start) * progress
+        elif schedule_type == "cosine":
+            # Cosine annealing from start to end
+            cosine_factor = (1 - math.cos(progress * math.pi)) / 2
+            return freeze_start + (freeze_end - freeze_start) * cosine_factor
+        elif schedule_type == "step":
+            # Step-wise decrease
+            steps = warmup_epochs
+            step_size = (freeze_start - freeze_end) / steps
+            return max(freeze_end, freeze_start - step_size * (epoch + 1))
+        else:
+            return self.config.video_freeze_ratio
+    
+    def _compute_text_freeze_schedule(self, epoch: int) -> float:
+        """
+        Compute scheduled text encoder freeze ratio for current epoch.
+        
+        Args:
+            epoch: Current epoch number (0-indexed)
+            
+        Returns:
+            Scheduled freeze ratio (1.0 = all frozen, 0.0 = all trainable)
+        """
+        schedule_type = getattr(self.config, "text_freeze_schedule", "constant")
+        freeze_start = getattr(self.config, "text_freeze_start", self.config.text_freeze_ratio)
+        freeze_end = getattr(self.config, "text_freeze_end", self.config.text_freeze_ratio)
+        warmup_epochs = getattr(self.config, "text_freeze_warmup_epochs", 0)
+        
+        if schedule_type == "constant" or warmup_epochs <= 0:
+            return self.config.text_freeze_ratio
+        
+        if epoch >= warmup_epochs:
+            return freeze_end
+        
+        progress = epoch / warmup_epochs
+        
+        if schedule_type == "linear":
+            return freeze_start + (freeze_end - freeze_start) * progress
+        elif schedule_type == "cosine":
+            # Cosine annealing from start to end
+            cosine_factor = (1 - math.cos(progress * math.pi)) / 2
+            return freeze_start + (freeze_end - freeze_start) * cosine_factor
+        elif schedule_type == "step":
+            # Step-wise decrease
+            steps = warmup_epochs
+            step_size = (freeze_start - freeze_end) / steps
+            return max(freeze_end, freeze_start - step_size * (epoch + 1))
+        else:
+            return self.config.text_freeze_ratio
+
+    def _scheduler_is_per_iteration(self) -> bool:
+        """
+        Returns True if the chosen scheduler is a Hugging Face style that
+        expects a call to .step() per iteration (batch). Otherwise, False.
+        """
+        # We do a simpler check to change scheduler update to per epoch or per batch:
+        # Example keywords: "linear_warmup", "cosine_with_warmup", 
+        # "cosine_with_hard_restarts_with_warmup", etc.
+        sched_name = getattr(self.config, "scheduler_name", "").lower()
+        # If it matches typical HF warmup schedulers, return True
+        HF_KEYS = ["warmup", "with_warmup"]
+        return any(k in sched_name for k in HF_KEYS)
+
+
+    def train(
+        self, 
+        start_epoch: int = 0, 
+        end_epoch: int = 10,
+    ):
+        """
+        Main training loop. Iterates through epochs, performing:
+          - Training step
+          - Validation step
+          - Checkpoint saving
+          - LR scheduling
+
+        :param start_epoch: Starting epoch index.
+        :param end_epoch: Ending epoch index.
+        :raises RuntimeError: If NaN loss is detected during training.
+        """
+        try:
+            for epoch in range(start_epoch, end_epoch):
+                # Synchronize before epoch starts
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+                
+                learnable_temp = getattr(self.config, "learnable_temperature", False)
+                if not learnable_temp:
+                    scheduled_temp = self._compute_temperature_schedule(epoch)
+                    scheduled_log_temp = torch.log(
+                        torch.tensor(
+                            [scheduled_temp],
+                            device=self.device,
+                            dtype=self.log_temp.dtype if self.log_temp is not None else torch.float32,
+                        )
+                    )
+                    if isinstance(self.log_temp, torch.nn.Parameter):
+                        with torch.no_grad():
+                            self.log_temp.data.copy_(scheduled_log_temp)
+                    else:
+                        self.log_temp = scheduled_log_temp
+                    if self.config.is_ref_device:
+                        print(f"\n[Epoch {epoch+1}] Temperature scheduled: {scheduled_temp:.4f}")
+                else:
+                    if self.log_temp is None:
+                        self.log_temp = torch.nn.Parameter(
+                            torch.log(
+                                torch.tensor(
+                                    [self.config.temperature],
+                                    dtype=torch.float32,
+                                    device=self.device,
+                                )
+                            )
+                        )
+                    scheduled_temp = float(torch.exp(self.log_temp.detach()).item())
+                    if self.config.is_ref_device:
+                        print(f"\n[Epoch {epoch+1}] Temperature (learnable): {scheduled_temp:.4f}")
+                
+                # Apply freeze ratio schedule for video encoder
+                scheduled_video_freeze = self._compute_freeze_schedule(epoch)
+                if hasattr(self.video_encoder, 'update_freeze_ratio'):
+                    self.video_encoder.update_freeze_ratio(scheduled_video_freeze)
+                    if self.config.is_ref_device:
+                        print(f"[Epoch {epoch+1}] Video freeze ratio scheduled: {scheduled_video_freeze:.2f}")
+                
+                # Apply freeze ratio schedule for text encoder
+                scheduled_text_freeze = self._compute_text_freeze_schedule(epoch)
+                if hasattr(self.text_encoder, 'update_freeze_ratio'):
+                    self.text_encoder.update_freeze_ratio(scheduled_text_freeze)
+                    if self.config.is_ref_device:
+                        print(f"[Epoch {epoch+1}] Text freeze ratio scheduled: {scheduled_text_freeze:.2f}")
+                
+                # Set epoch for both train and val samplers (ensures deterministic behavior)
+                if hasattr(self.train_loader.sampler, 'set_epoch'):
+                    self.train_loader.sampler.set_epoch(epoch)
+                if hasattr(self.val_loader.sampler, 'set_epoch'):
+                    self.val_loader.sampler.set_epoch(epoch)  # Important for validation stability
+
+                # Training phase
+                train_metrics: dict[str, float] = self._run_epoch(mode=RunMode.TRAIN, epoch=epoch)
+                
+                # Add scheduled values to metrics
+                train_metrics["train/scheduled_temperature"] = scheduled_temp
+                train_metrics["train/temperature"] = scheduled_temp
+                current_log_temp = float(self.log_temp.detach().item()) if self.log_temp is not None else float(math.log(scheduled_temp))
+                train_metrics["train/log_temp"] = current_log_temp
+                train_metrics["train/scheduled_video_freeze_ratio"] = scheduled_video_freeze
+                train_metrics["train/scheduled_text_freeze_ratio"] = scheduled_text_freeze
+                if self.wandb_wrapper.is_initialized() and self.config.is_ref_device:
+                    # Let wandb auto-increment steps
+                    self.wandb_wrapper.log(train_metrics)
+                    print(f"[DEBUG] rank={self.device} => Logged train metrics to W&B")
+
+                # Sync before validation
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+
+                # Validation phase
+                val_metrics: dict[str, float] = self._run_epoch(
+                    mode=RunMode.VALIDATE, 
+                    epoch=epoch
+                )
+                
+                # Sync after validation
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+
+                # Empty-epoch guard: num_batches is recorded inside _run_epoch
+                # and returned via the metrics dict (do NOT reference a raw
+                # batch_count here -- it is scoped to _run_epoch).
+                train_num_batches = train_metrics.get("train/num_batches", 0.0)
+                val_num_batches = val_metrics.get("val/num_batches", 0.0)
+                if train_num_batches == 0 or val_num_batches == 0:
+                    raise RuntimeError(
+                        f"Empty epoch detected at epoch {epoch + 1}: "
+                        f"train/num_batches={train_num_batches}, "
+                        f"val/num_batches={val_num_batches}. "
+                        "No batches contributed to the epoch."
+                    )
+
+                # If it's an epoch-based scheduler (like StepLR, CosineAnnealingLR, etc.),
+                # call lr_scheduler.step() after each epoch
+                if self.lr_scheduler and (not self.scheduler_per_iteration) and train_num_batches > 0:
+                    self.lr_scheduler.step()
+
+                # Update best model
+                if val_metrics["val/loss"] < self.best_val_loss:
+                    prev_best: float = self.best_val_loss
+                    self.best_val_loss = val_metrics["val/loss"]
+                    self.best_epoch = epoch
+                    if self.config.is_ref_device:
+                        print(
+                            f"\nNew best model! Val Loss: {val_metrics['val/loss']:.4f} "
+                            f"(previous: {prev_best:.4f})"
+                        )
+                        self._save_checkpoint(
+                            epoch=epoch,
+                            metrics={
+                                **train_metrics, 
+                                **val_metrics
+                            },
+                            is_best=True,
+                        )
+                
+                # Update and save model with highest alignment score
+                if val_metrics["val/alignment_score"] > self.highest_alignment_score:
+                    prev_highest: float = self.highest_alignment_score
+                    self.highest_alignment_score = val_metrics["val/alignment_score"]
+                    self.highest_alignment_epoch = epoch
+                    if self.config.is_ref_device:
+                        print(
+                            f"\nNew highest alignment score model! Alignment Score: {val_metrics['val/alignment_score']:.4f} "
+                            f"(previous: {prev_highest:.4f})"
+                        )
+                        self._save_checkpoint(
+                            epoch=epoch,
+                            metrics={
+                                **train_metrics, 
+                                **val_metrics
+                            },
+                            is_best=False,
+                            is_highest_alignment=True,
+                        )
+
+                # Always save "latest" checkpoint
+                if self.config.is_ref_device:
+                    self._save_checkpoint(
+                        epoch=epoch,
+                        metrics={**train_metrics, **val_metrics},
+                        is_best=False,
+                    )
+                
+                # Sync after saving checkpoint
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+                            
+                if self.wandb_wrapper.is_initialized() and self.config.is_ref_device:
+                    val_metrics['best_val_loss'] = self.best_val_loss
+                    val_metrics['highest_alignment_score'] = self.highest_alignment_score
+                    self.wandb_wrapper.log(val_metrics)
+                    print(f"[DEBUG] rank={self.device} => Logged val metrics to W&B")
+                
+                # Sync after logging
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+
+                patience = getattr(self.config, 'early_stop_patience', 0)
+                if patience and patience > 0 and self.best_epoch >= 0:
+                    epochs_since_best = epoch - self.best_epoch
+                    if epochs_since_best >= patience:
+                        if self.config.is_ref_device:
+                            print(
+                                f"[EarlyStopping] No val improvement for {epochs_since_best} epochs "
+                                f"(patience={patience}); stopping training."
+                            )
+                        break
+
+                # ------------------------------------------------------------------
+                # Memory cleanup to avoid GPU OOM across epochs
+                # ------------------------------------------------------------------
+                # Use locals() checks to prevent NameError in static analysis
+                for _var in [
+                    'similarity_matrix',
+                    'global_video_feats_norm',
+                    'unique_text_embeddings_norm',
+                    'unique_text_embeddings_tensor',
+                    'global_video_feats',
+                ]:
+                    if _var in locals():
+                        del locals()[_var]
+                torch.cuda.empty_cache()
+                import gc
+                gc.collect()
+
+        except RuntimeError as e:
+            if "NaN loss" in str(e):
+                if self.config.is_ref_device:
+                    print("\nTraining stopped due to NaN loss. Saving final checkpoint...")
+                    # Save a checkpoint with the error state
+                    self._save_checkpoint(
+                        epoch=epoch,
+                        metrics={
+                            "error": str(e),
+                            "train/loss": float("nan"),
+                            "val/loss": float("nan"),
+                        },
+                        is_best=False,
+                    )
+            raise  # Re-raise the exception after saving checkpoint
+
+    def _gather_tensor_along_batch(self, local_tensor: torch.Tensor, world_size: int) -> torch.Tensor:
+        """
+        Gathers tensors across multiple ranks along the batch dimension (dim=0).
+
+        :param local_tensor: Local tensor to gather from current rank.
+        :param world_size: Number of participating ranks.
+        :return: Concatenated tensor containing data from all ranks.
+        """
+        if self.config.world_size < 2:
+            return local_tensor
+
+        device: int = local_tensor.device
+        local_size: torch.Tensor = torch.tensor([local_tensor.shape[0]], device=device, dtype=torch.long)
+        sizes_list: list[torch.Tensor] = [torch.zeros_like(local_size) for _ in range(world_size)]
+        DistributedUtils.dist.all_gather(sizes_list, local_size)
+        sizes_list: list[int] = [s.item() for s in sizes_list]
+        max_size: int = max(sizes_list)
+
+        # Pad to max_size along dim=0
+        if local_tensor.dim() == 1:
+            pad: tuple[int, int] = (0, max_size - local_tensor.shape[0])
+            padded: torch.Tensor = torch.nn.functional.pad(local_tensor, pad, "constant", 0)
+        else:
+            pad_rows: int = max_size - local_tensor.shape[0]
+            if pad_rows > 0:
+                padded: torch.Tensor = torch.nn.functional.pad(local_tensor, (0, 0, 0, pad_rows))
+            else:
+                padded: torch.Tensor = local_tensor
+
+        gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+        DistributedUtils.dist.all_gather(gathered, padded)
+
+        cat: torch.Tensor = torch.stack(gathered, dim=0)
+        out_list: list[torch.Tensor] = []
+        for rank_idx in range(world_size):
+            actual_size: int = sizes_list[rank_idx]
+            if local_tensor.dim() == 1:
+                out_list.append(cat[rank_idx, :actual_size])
+            else:
+                out_list.append(cat[rank_idx, :actual_size, :])
+        return torch.cat(out_list, dim=0)
+
+    def _gather_strings_across_gpus(
+        self, local_strings: list[str], world_size: int, device: torch.device
+    ) -> list[str]:
+        """
+        Gathers lists of strings from multiple ranks into one combined list.
+
+        :param local_strings: List of strings on the current rank.
+        :param world_size: Number of participating ranks.
+        :param device: CUDA device.
+        :return: Combined list of strings from all ranks.
+        """
+        if self.config.world_size < 2:
+            return local_strings
+
+        import pickle
+
+        local_data_bytes: bytes = pickle.dumps(local_strings)
+        local_size: torch.Tensor = torch.tensor([len(local_data_bytes)], dtype=torch.long, device=device)
+
+        sizes_list: list[torch.Tensor] = [torch.zeros_like(local_size) for _ in range(world_size)]
+        DistributedUtils.dist.all_gather(sizes_list, local_size)
+        sizes_list: list[int] = [s.item() for s in sizes_list]
+        max_size: int = max(sizes_list)
+
+        local_buffer: torch.Tensor = torch.zeros(max_size, dtype=torch.uint8, device=device)
+        local_buffer[: local_size.item()] = torch.as_tensor(
+            list(local_data_bytes), dtype=torch.uint8, device=device
+        )
+
+        all_buffers: list[torch.Tensor] = [torch.zeros(max_size, dtype=torch.uint8, device=device) for _ in range(world_size)]
+        DistributedUtils.dist.all_gather(all_buffers, local_buffer)
+
+        out_list = []
+        for rank_idx, buf in enumerate(all_buffers):
+            size: int = sizes_list[rank_idx]
+            valid_bytes: bytes = buf[:size].cpu().numpy().tobytes()
+            str_list: list[str] = pickle.loads(valid_bytes)
+            out_list.extend(str_list)
+
+        return out_list
+
+    def _gather_nested_lists(
+        self, local_nested: list[list[str]], world_size: int, device: torch.device
+    ) -> list[list[str]]:
+        """
+        Gathers nested string lists (list of list of str) across ranks.
+
+        :param local_nested: Nested list on current rank.
+        :param world_size: Number of participating ranks.
+        :param device: CUDA device for temporary tensors.
+        :return: Combined nested list from all ranks.
+        """
+        if self.config.world_size < 2:
+            return local_nested
+
+        import pickle
+
+        local_bytes: bytes = pickle.dumps(local_nested)
+        local_size = torch.tensor([len(local_bytes)], dtype=torch.long, device=device)
+
+        sizes_list: list[torch.Tensor] = [torch.zeros_like(local_size) for _ in range(world_size)]
+        DistributedUtils.dist.all_gather(sizes_list, local_size)
+        sizes: list[int] = [s.item() for s in sizes_list]
+        max_size: int = max(sizes) if sizes else 0
+
+        buffer = torch.zeros(max_size, dtype=torch.uint8, device=device)
+        if local_size.item() > 0:
+            buffer[: local_size.item()] = torch.tensor(
+                list(local_bytes), dtype=torch.uint8, device=device
+            )
+
+        gathered_buffers: list[torch.Tensor] = [
+            torch.zeros(max_size, dtype=torch.uint8, device=device) for _ in range(world_size)
+        ]
+        DistributedUtils.dist.all_gather(gathered_buffers, buffer)
+
+        combined: list[list[str]] = []
+        for size, buf in zip(sizes, gathered_buffers):
+            if size == 0:
+                continue
+            valid_bytes = buf[:size].cpu().numpy().tobytes()
+            combined.extend(pickle.loads(valid_bytes))
+
+        return combined
+
+    def _run_epoch(
+        self, 
+        mode: str, 
+        epoch: int
+    ) -> dict[str, float]:
+        """
+        Runs either a training or validation epoch. Gathers embeddings across ranks
+        and optionally computes NxN retrieval metrics on rank 0.
+
+        :param mode: One of ["train", "val"] indicating the mode.
+        :param epoch: Current epoch index.
+        :return: Dictionary of metrics, averaged over all batches and reduced across ranks.
+        :raises RuntimeError: If NaN loss is detected during training.
+        """
+        assert mode in [RunMode.TRAIN, RunMode.VALIDATE]
+
+        self.video_encoder.train(mode == RunMode.TRAIN)
+        self.text_encoder.train(mode == RunMode.TRAIN)
+        
+        # Extra synchronization for validation to ensure all ranks start together
+        if mode == RunMode.VALIDATE:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                if self.config.is_ref_device:
+                    print(f"[Validation] All ranks synchronized, starting validation epoch {epoch + 1}")
+
+        total_loss: float = 0.0
+        epoch_metrics: dict[str, float] = {}
+
+        dataloader: DataLoader = self.train_loader if mode == RunMode.TRAIN else self.val_loader
+        # Explicitly cast dataset to VideoClipDataset for type safety and access to custom methods
+        dataset: VideoClipDataset = dataloader.dataset # type: ignore
+        
+        # Improved type hint for step_fn
+        step_fn: Callable[..., Tuple[Dict[str, Any], Dict[str, torch.Tensor]]] = self._train_step if mode == RunMode.TRAIN else self._val_step
+
+
+        # Store local embeddings & text for retrieval computations
+        all_video_embeddings_local: List[torch.Tensor] = []
+        all_text_embeddings_local: List[torch.Tensor] = []
+        all_paths_local: List[str] = []
+        all_positive_texts_local: List[List[str]] = []
+
+        tqdm_desc = f"[GPU {self.device}] Running {mode} Epoch {epoch + 1}"
+        
+        # Determine the iterator: tqdm-wrapped or raw dataloader
+        iterator_obj: Any = dataloader # Use Any for iterator_obj as it can be DataLoader or tqdm
+        if self.config.is_ref_device or (self.device == 0):
+            iterator_obj = tqdm(dataloader, desc=tqdm_desc)
+
+        batch_count: int = 0
+        for _, batch in enumerate(iterator_obj, start=1): # Use iterator_obj
+            # For validation, NEVER skip batches to maintain rank synchronization
+            if mode == RunMode.TRAIN and (batch["videos"] is None or batch["encoded_texts"] is None):
+                continue
+            elif mode == RunMode.VALIDATE and (batch["videos"] is None or batch["encoded_texts"] is None):
+                # Create dummy tensors to maintain synchronization across ranks
+                if self.config.is_ref_device:
+                    print(f"Warning: Empty batch in validation at batch {batch_count+1}, using dummy tensors")
+                # Use existing batch structure but with dummy values
+                if batch["videos"] is None:
+                    batch["videos"] = torch.zeros(1, 3, self.config.frames, 224, 224, device=self.device)
+                if batch["encoded_texts"] is None:
+                    batch["encoded_texts"] = {"input_ids": torch.zeros(1, 1, dtype=torch.long, device=self.device),
+                                            "attention_mask": torch.zeros(1, 1, dtype=torch.long, device=self.device)}
+
+            step_inputs, paths_or_sids = self._preprocess_inputs(batch)
+
+            sample_info = None
+            if self.config.is_ref_device and self._should_debug_batch():
+                sample_cap = max(0, getattr(self.config, 'siglip_debug_sample_count', 0))
+                if sample_cap > 0:
+                    sample_info = []
+                    paths = list(batch.get('paths', []))
+                    reports = list(batch.get('reports', []))
+                    positive_mask_batch = batch.get('positive_mask')
+                    positive_weights_batch = batch.get('positive_weights')
+                    text_metadata_batch = batch.get('text_metadata')
+                    dataset: VideoClipDataset = dataloader.dataset  # type: ignore
+                    mask_cpu = positive_mask_batch.detach().cpu() if isinstance(positive_mask_batch, torch.Tensor) else None
+                    weight_cpu = positive_weights_batch.detach().cpu() if isinstance(positive_weights_batch, torch.Tensor) else None
+                    meta_list = text_metadata_batch if isinstance(text_metadata_batch, list) else None
+                    for idx, path in enumerate(paths[:sample_cap]):
+                        entry: Dict[str, Any] = {
+                            'path': str(path)
+                        }
+                        if idx < len(reports):
+                            entry['text'] = reports[idx]
+                        if hasattr(dataset, 'video_path_to_idx'):
+                            vid_idx = dataset.video_path_to_idx.get(str(path))
+                            if vid_idx is not None and vid_idx < len(dataset.video_ids):
+                                entry['video_id'] = dataset.video_ids[vid_idx]
+                        if mask_cpu is not None and meta_list is not None and idx < mask_cpu.size(0):
+                            row = mask_cpu[idx]
+                            prompt_texts = []
+                            prompt_ids = []
+                            prompt_weights: List[float] = []
+                            for col in (row > 0).nonzero(as_tuple=False).flatten().tolist():
+                                if col < len(meta_list):
+                                    prompt_ids.append(meta_list[col].get('text_id'))
+                                    prompt_texts.append(meta_list[col].get('prompt_text', ''))
+                                    if weight_cpu is not None:
+                                        prompt_weights.append(float(weight_cpu[idx, col].item()))
+                            entry['prompt_ids'] = prompt_ids
+                            entry['prompts'] = prompt_texts
+                            if prompt_weights:
+                                entry['positive_weights'] = prompt_weights
+                                entry['positive_weight_stats'] = {
+                                    'min': float(torch.tensor(prompt_weights).min().item()),
+                                    'max': float(torch.tensor(prompt_weights).max().item()),
+                                    'mean': float(torch.tensor(prompt_weights).mean().item()),
+                                }
+                            entry['negative_weight'] = float(getattr(self.config, 'siglip_negative_weight', 1.0))
+                        sample_info.append(entry)
+                    if sample_info:
+                        step_inputs['debug_sample_info'] = sample_info
+
+            batch_metrics, embeddings = step_fn(**step_inputs)
+
+            if torch.isnan(embeddings["video_embeddings"]).any():
+                if self.config.is_ref_device:
+                    print(f"Warning: NaN video embeddings detected at epoch {epoch+1}, batch {batch_count+1}; paths={paths_or_sids}")
+                embeddings["video_embeddings"] = torch.nan_to_num(embeddings["video_embeddings"], nan=0.0)
+            if torch.isnan(embeddings["text_embeddings"]).any():
+                if self.config.is_ref_device:
+                    print(f"Warning: NaN text embeddings detected at epoch {epoch+1}, batch {batch_count+1}; paths={paths_or_sids}")
+                embeddings["text_embeddings"] = torch.nan_to_num(embeddings["text_embeddings"], nan=0.0)
+
+            # Check for NaN loss
+            if torch.isnan(torch.tensor(batch_metrics["loss"])):
+                error_msg = f"NaN loss detected in {mode} at epoch {epoch + 1}, batch {batch_count + 1}"
+                if self.config.is_ref_device:
+                    print(f"\nERROR: {error_msg}")
+                    print(f"  paths: {paths_or_sids}")
+                    print(f"  batch_metrics: {batch_metrics}")
+                raise RuntimeError(error_msg)
+
+            # Store embeddings on CPU
+            all_video_embeddings_local.append(embeddings["video_embeddings"].cpu())
+            all_text_embeddings_local.append(embeddings["text_embeddings"].cpu())
+
+            # Use dataset.multi_video_mode for consistency
+            # paths_or_sids contains SIDs in multi-video mode, and direct file paths in single-video mode.
+            # all_paths_local will store these identifiers directly.
+            all_paths_local.extend(paths_or_sids)
+
+            paths_list: List[str] = list(batch.get('paths', []))
+            batch_reports: List[str] = list(batch.get("reports", []))
+            positive_mask_batch = batch.get('positive_mask')
+            text_metadata_batch = batch.get('text_metadata')
+
+            batch_positive_texts: List[List[str]] = []
+            if (
+                isinstance(positive_mask_batch, torch.Tensor)
+                and isinstance(text_metadata_batch, list)
+                and positive_mask_batch.numel() > 0
+            ):
+                mask_cpu = positive_mask_batch.detach().cpu()
+                meta_list = text_metadata_batch
+                for row_idx in range(mask_cpu.size(0)):
+                    prompts: List[str] = []
+                    active_cols = (mask_cpu[row_idx] > 0).nonzero(as_tuple=False).flatten().tolist()
+                    for col in active_cols:
+                        if col < len(meta_list):
+                            prompt_text = meta_list[col].get('prompt_text', '')
+                            if prompt_text:
+                                prompts.append(prompt_text)
+                    if not prompts and row_idx < len(batch_reports):
+                        fallback_prompt = batch_reports[row_idx]
+                        if fallback_prompt:
+                            prompts.append(fallback_prompt)
+                    batch_positive_texts.append(prompts)
+            else:
+                for report_text in batch_reports:
+                    prompts = [report_text] if report_text else []
+                    batch_positive_texts.append(prompts)
+
+            if len(batch_positive_texts) < len(paths_list):
+                batch_positive_texts.extend([] for _ in range(len(paths_list) - len(batch_positive_texts)))
+
+            all_positive_texts_local.extend(batch_positive_texts)
+
+            # accumulate metrics
+            for k, v in batch_metrics.items():
+                epoch_metrics[k] = epoch_metrics.get(k, 0.0) + float(v)
+
+            total_loss += float(batch_metrics["loss"])
+            batch_count += 1
+
+            if (self.config.is_ref_device or (self.device == 0)) and mode == RunMode.TRAIN:
+                if hasattr(iterator_obj, 'set_postfix'): # Check if it's the tqdm instance
+                    iterator_obj.set_postfix(
+                        {
+                            f"{mode}_loss": f"{batch_metrics['loss']:.4f}", # Use mode variable
+                            "avg_loss": f"{(total_loss / batch_count):.4f}",
+                        }
+                    )
+
+        if 'batch_metrics' in locals():
+            del batch_metrics
+        if 'embeddings' in locals():
+            del embeddings
+        torch.cuda.empty_cache()
+
+        # finalize epoch metrics
+        if batch_count > 0:
+            for k in epoch_metrics.keys():
+                epoch_metrics[k] /= batch_count
+
+        # 1) Concat local feats
+        if len(all_video_embeddings_local) > 0:
+            local_video_feats: torch.Tensor = torch.cat(all_video_embeddings_local, dim=0).to(self.device)
+            local_text_feats: torch.Tensor = torch.cat(all_text_embeddings_local, dim=0).to(self.device)
+        else:
+            local_video_feats: torch.Tensor = torch.empty((0, 512), device=self.device)
+            local_text_feats: torch.Tensor = torch.empty((0, 512), device=self.device)
+
+        # 2) gather across GPUs
+        global_video_feats: torch.Tensor = self._gather_tensor_along_batch(local_video_feats, self.world_size)
+
+        # 3) gather paths & reports
+        global_paths: list[str] = self._gather_strings_across_gpus(
+            all_paths_local, self.world_size, device=local_video_feats.device
+        )
+        global_positive_texts: list[list[str]] = self._gather_nested_lists(
+            all_positive_texts_local, self.world_size, device=local_video_feats.device
+        )
+        primary_reports: list[str] = [texts[0] if texts else "" for texts in global_positive_texts]
+        joined_reports: list[str] = [" | ".join(texts) if texts else "" for texts in global_positive_texts]
+
+        # Optionally compute NxM retrieval metrics on rank 0
+        retrieval_metrics: dict[str, float] = {}
+        if mode == "val" and self.config.is_ref_device:
+            print(
+                f"[DEBUG rank={self.device}] Starting retrieval computation with {global_video_feats.shape[0]} videos."
+            )
+            
+            # Step 1: Deduplicate texts and create mapping
+            flattened_texts: List[str] = [
+                text for texts in global_positive_texts for text in texts if text
+            ]
+            unique_texts: List[str] = sorted(set(flattened_texts))
+            if not unique_texts:
+                unique_texts = [""]
+            text_to_index: Dict[str, int] = {text: idx for idx, text in enumerate(unique_texts)}
+            
+            # Step 2: Resolve ground-truth index sets for each video
+            ground_truth_index_sets: List[List[int]] = []
+            primary_indices: List[int] = []
+            for vid_idx, texts in enumerate(global_positive_texts):
+                indices_for_video: List[int] = []
+                seen: Set[int] = set()
+                for text in texts:
+                    mapped_idx = text_to_index.get(text)
+                    if mapped_idx is not None and mapped_idx not in seen:
+                        indices_for_video.append(mapped_idx)
+                        seen.add(mapped_idx)
+
+                if not indices_for_video:
+                    fallback_text = primary_reports[vid_idx]
+                    mapped_idx = text_to_index.get(fallback_text)
+                    if mapped_idx is None:
+                        raise ValueError(
+                            "Missing ground-truth text in mapping: "
+                            f"'{fallback_text}' for identifier '{global_paths[vid_idx]}'"
+                        )
+                    indices_for_video.append(mapped_idx)
+
+                ground_truth_index_sets.append(indices_for_video)
+                primary_indices.append(indices_for_video[0])
+
+            ground_truth_indices: torch.Tensor = torch.tensor(
+                primary_indices,
+                device=self.device,
+                dtype=torch.long
+            )
+            ground_truth_indices_cpu: torch.Tensor = ground_truth_indices.detach().cpu()
+            
+            total_positives = sum(len(texts) for texts in global_positive_texts)
+            print(
+                f"[DEBUG rank={self.device}] Found {len(unique_texts)} unique texts out of {total_positives} total positive assignments."
+            )
+            
+            # Step 3: Encode unique texts
+            unique_text_embeddings_list: List[torch.Tensor] = [] # Renamed list
+            batch_size: int = 64  # Process in batches to avoid OOM
+            
+            self.text_encoder.eval()
+            with torch.no_grad():
+                for start_idx in range(0, len(unique_texts), batch_size):
+                    end_idx = min(start_idx + batch_size, len(unique_texts))
+                    text_batch = unique_texts[start_idx:end_idx]
+                    
+                    # Tokenize batch, Handle both DDP and non-DDP cases for text encoder
+                    tokenizer = (
+                        self.text_encoder.module.tokenizer 
+                        if hasattr(self.text_encoder, "module") 
+                        else self.text_encoder.tokenizer
+                    )
+                    encoded = tokenizer(
+                        text_batch,
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt"
+                    ).to(self.device)
+                    # Get embeddings
+                    text_embs = self.text_encoder(
+                        encoded["input_ids"],
+                        encoded["attention_mask"]
+                    )
+                    text_embs = torch.nan_to_num(text_embs, nan=0.0, posinf=1e4, neginf=-1e4)
+                    if not torch.isfinite(text_embs).all():
+                        if self.config.is_ref_device:
+                            print(
+                                "Warning: non-finite deduplicated text embeddings detected; sanitising to zeros"
+                            )
+                        text_embs = torch.zeros_like(text_embs)
+                    unique_text_embeddings_list.append(text_embs) # Append to renamed list
+            
+            # Concatenate all batches into a new tensor variable
+            unique_text_embeddings_tensor: torch.Tensor = torch.cat(unique_text_embeddings_list, dim=0)
+            
+            # Step 4: Normalize embeddings
+            global_video_feats_norm: torch.Tensor = nn.functional.normalize(global_video_feats, dim=1)
+            unique_text_embeddings_norm: torch.Tensor = nn.functional.normalize(unique_text_embeddings_tensor, dim=1) # Use normalized tensor
+            
+            # Step 5: Compute NxM similarity matrix
+            similarity_matrix: torch.Tensor = torch.matmul(global_video_feats_norm, unique_text_embeddings_norm.t()) # Use normalized embeddings
+            print(
+                f"[DEBUG rank={self.device}] Computed NxM sim matrix with shape={similarity_matrix.shape}"
+            )
+            
+            # Log best/worst retrievals using unique texts
+            if self.config.is_ref_device and self.wandb_wrapper.is_initialized():
+                # Calculate global step for consistent wandb logging
+                wandb_step = epoch * len(self.train_loader) + len(self.train_loader)
+                log_best_worst_retrievals(
+                    similarity_matrix=similarity_matrix,
+                    all_paths=global_paths,
+                    unique_texts=unique_texts,
+                    ground_truth_indices=ground_truth_indices_cpu,
+                    ground_truth_texts=global_positive_texts,
+                    epoch=epoch,
+                    wandb_wrapper=self.wandb_wrapper,
+                    dataset_obj=dataset, # Pass the dataset object
+                    step=wandb_step
+                )
+
+            # Save retrieval results with mapping
+            save_retrieval_results(
+                similarity_matrix=similarity_matrix,
+                all_identifiers=global_paths, # Pass SIDs or file paths
+                all_ground_truth_reports=joined_reports,
+                report_to_global_index=text_to_index,
+                epoch=epoch,
+                output_dir=self.output_dir,
+                dataset_obj=dataset, # Pass the dataset object
+                ground_truth_index_sets=ground_truth_index_sets,
+            )
+            print(f"[DEBUG rank={self.device}] Ground truth index set sizes: {[len(s) for s in ground_truth_index_sets[:10]]}")
+
+            # Compute retrieval metrics using ground truth indices
+            recall_metrics: Dict[str, float] = compute_recall_at_k( # Ensure it's a Dict
+                similarity_matrix, ground_truth_index_sets, k_values=self.config.recall_k
+            )
+            mrr_score_dict: Dict[str, float] = compute_mrr(
+                similarity_matrix, ground_truth_index_sets
+            )
+            map_score: float = compute_map(similarity_matrix, ground_truth_index_sets)
+            median_rank_score: float = compute_median_rank(similarity_matrix, ground_truth_index_sets)
+            ndcg_scores_dict: Dict[str, float] = compute_ndcg_at_k( # Assign to dict
+                similarity_matrix, ground_truth_index_sets, k_values=self.config.ndcg_k
+            )
+
+            retrieval_metrics.update(recall_metrics)
+            retrieval_metrics.update(mrr_score_dict) # Update with dict
+            retrieval_metrics.update(ndcg_scores_dict) # Update with dict
+            retrieval_metrics["MAP"] = map_score
+            retrieval_metrics["MedianRank_V2T"] = median_rank_score
+
+            # Additive multi-positive recall (RecallAny@K): a hit if ANY true
+            # positive text for the video appears in the top-K. This runs only
+            # on rank 0 where the global NxM similarity matrix and the
+            # per-video ground-truth index sets are already assembled, so it
+            # adds no extra DDP coordination. It is logged ALONGSIDE the
+            # existing Recall@K (which is left untouched).
+            try:
+                from utils.retrieval_metrics import (
+                    compute_multi_positive_recall_at_k,
+                )
+
+                num_videos = similarity_matrix.size(0)
+                num_texts = similarity_matrix.size(1)
+                multi_pos_mask = torch.zeros(
+                    (num_videos, num_texts),
+                    dtype=torch.float,
+                    device=similarity_matrix.device,
+                )
+                for row_idx, idx_set in enumerate(ground_truth_index_sets):
+                    for col_idx in idx_set:
+                        if 0 <= col_idx < num_texts:
+                            multi_pos_mask[row_idx, col_idx] = 1.0
+                recall_any_metrics = compute_multi_positive_recall_at_k(
+                    similarity_matrix,
+                    multi_pos_mask,
+                    self.config.recall_k,
+                )
+                for k_name, k_val in recall_any_metrics.items():
+                    suffix = k_name.split("@")[-1] if "@" in k_name else k_name
+                    retrieval_metrics[f"RecallAny@{suffix}"] = float(k_val)
+            except ImportError:
+                if self.config.is_ref_device:
+                    print(
+                        "[DEBUG] compute_multi_positive_recall_at_k unavailable; "
+                        "skipping RecallAny@K (existing Recall@K path unaffected)."
+                    )
+            except Exception as exc:  # noqa: BLE001 - never fail the run on an additive metric
+                if self.config.is_ref_device:
+                    print(f"[WARN] RecallAny@K computation failed: {exc}")
+            
+            # Save unique texts and their indices
+            df_texts: pd.DataFrame = pd.DataFrame({
+                "Index": range(len(unique_texts)),
+                "Text": unique_texts
+            })
+            texts_csv_path: str = os.path.join(self.output_dir, f"val_unique_texts.csv")
+            df_texts.to_csv(texts_csv_path, index=False)
+            print(f"[DEBUG rank={self.device}] Saved {len(unique_texts)} unique texts to {texts_csv_path}")
+            
+            # Also save text embeddings for future use
+            embeddings_path: str = os.path.join(self.output_dir, f"val_text_embeddings_epoch_{epoch}.pt")
+            torch.save({
+                'text_embeddings': unique_text_embeddings_tensor.cpu(), # Save the concatenated tensor
+                'text_to_index': text_to_index,
+                'unique_texts': unique_texts
+            }, embeddings_path)
+            print(f"[DEBUG rank={self.device}] Saved text embeddings to {embeddings_path}")
+            
+            print(
+                f"[DEBUG rank={self.device}] Completed retrieval metrics & logging for val at epoch={epoch}"
+            )
+        else:
+            # Non-zero ranks: placeholders for the same metrics
+            for k_val in self.config.recall_k:
+                retrieval_metrics[f"Recall@{k_val}"] = 0.0
+            retrieval_metrics.update({
+                "MRR": 0.0,
+                "MAP": 0.0,
+                "MedianRank_V2T": 0.0,
+            })
+            for k_val in self.config.ndcg_k:
+                retrieval_metrics[f"NDCG@{k_val}"] = 0.0
+
+        if self.config.is_ref_device:
+            flat_texts = [text for texts in global_positive_texts for text in texts if text]
+            unique_prompt_count = len(set(flat_texts))
+            videos_with_prompts = sum(1 for texts in global_positive_texts if texts)
+            videos_without_prompts = len(global_positive_texts) - videos_with_prompts
+            mean_loss = (total_loss / batch_count) if batch_count > 0 else float("nan")
+            print(
+                f"[DEBUG rank={self.device}] Epoch {epoch + 1} {mode} summary | "
+                f"videos={len(global_positive_texts)} | with_prompts={videos_with_prompts} | "
+                f"without_prompts={videos_without_prompts} | total_prompts={len(flat_texts)} | "
+                f"unique_prompts={unique_prompt_count} | mean_loss={mean_loss:.4f}"
+            )
+
+        epoch_metrics.update(retrieval_metrics)
+
+        # Record how many batches contributed to this epoch so callers can
+        # detect empty epochs without referencing the local batch_count.
+        epoch_metrics["num_batches"] = float(batch_count)
+
+        # 4) reduce final epoch metrics across ranks
+        gathered_metrics: dict[str, float] = {}
+        for k, v in epoch_metrics.items():
+            gathered_metrics[f"{mode}/{k}"] = self._maybe_reduce_metric(k, v)
+
+        return gathered_metrics
+
+    # Retrieval metrics are computed on rank 0 from already-gathered global
+    # features; non-zero ranks only insert zero placeholders. Averaging them
+    # via all_reduce would dilute rank-0's true value (halved with 2 GPUs,
+    # quartered with 4), so these must bypass DDP reduction entirely.
+    RETRIEVAL_PREFIXES = (
+        "Recall@",
+        "RecallAny@",
+        "MRR",
+        "MRR_V2T",
+        "MAP",
+        "MedianRank",
+        "NDCG@",
+    )
+
+    def _is_retrieval_metric(self, name: str) -> bool:
+        """Returns True if the metric name is a rank-0-only retrieval metric."""
+        return any(name.startswith(prefix) for prefix in self.RETRIEVAL_PREFIXES)
+
+    def _maybe_reduce_metric(self, name: str, val: float) -> float:
+        """
+        Optionally reduces (averages) a metric value across all ranks in DDP.
+
+        Retrieval-prefixed metrics (Recall@K, MRR, MRR_V2T, MAP, MedianRank,
+        NDCG@K) are computed only on rank 0 from globally-gathered features, so
+        they are returned unreduced (rank 0's value). Only non-retrieval metrics
+        get all_reduce AVG, and only when world_size > 1.
+
+        :param name: Metric name; controls whether all_reduce is applied.
+        :param val: Metric value on current rank.
+        :return: Mean metric value across all ranks for non-retrieval metrics
+            (if DDP is initialized); otherwise the unreduced rank-local value.
+        """
+        if self._is_retrieval_metric(name):
+            return val
+        if self.config.world_size > 1:
+            t = torch.tensor([val], dtype=torch.float, device=self.device)
+            DistributedUtils.dist.all_reduce(t, op=DistributedUtils.dist.ReduceOp.AVG)
+            return t.item()
+        else:
+            return val
+
+    def _save_checkpoint(self, epoch: int, metrics: dict, is_best: bool = False, is_highest_alignment: bool = False):
+        """
+        Saves model checkpoint (including model weights, optimizer, scheduler, and metrics).
+
+        :param epoch: Current epoch index.
+        :param metrics: Dictionary of metrics to be saved.
+        :param is_best: If True, saves as 'best_model_epoch_{epoch}.pt'. Otherwise, saves as 'checkpoint.pt'.
+        :param is_highest_alignment: If True, saves as 'highest_alignment_epoch_{epoch}.pt'.
+        """
+        checkpoint_dir = os.path.join(self.output_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        model_dict = {
+            "video_encoder": self.video_encoder.module.state_dict()
+            if hasattr(self.video_encoder, "module")
+            else self.video_encoder.state_dict(),
+            "text_encoder": self.text_encoder.module.state_dict()
+            if hasattr(self.text_encoder, "module")
+            else self.text_encoder.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            "epoch": epoch,
+            "scaler": self.scaler.state_dict() if self.scaler else None,
+        }
+
+        checkpoint = {
+            **model_dict,
+            **metrics,
+            # Persist the RAW log-temperature (plus its exp for readability) so
+            # resume restores the exact effective temperature. Restoring the
+            # logged ``train/temperature`` (== exp(log_temp)) into ``log_temp``
+            # would corrupt the effective temperature T -> exp(T).
+            "log_temp": self.log_temp.detach().cpu()
+            if self.log_temp is not None
+            else None,
+            "temperature": self.log_temp.detach().exp().cpu()
+            if self.log_temp is not None
+            else None,
+            "best_val_loss": self.best_val_loss,
+            "best_epoch": self.best_epoch,
+            "highest_alignment_score": self.highest_alignment_score,
+            "highest_alignment_epoch": self.highest_alignment_epoch,
+        }
+
+        if is_best:
+            save_path = os.path.join(checkpoint_dir, f"best_model_epoch_{epoch}.pt")
+        elif is_highest_alignment:
+            save_path = os.path.join(checkpoint_dir, f"highest_alignment_epoch_{epoch}.pt")
+        else:
+            save_path = os.path.join(checkpoint_dir, "checkpoint.pt")
+            
+        torch.save(checkpoint, save_path)
+        print(
+            f"\nSaved {('best' if is_best else 'highest alignment' if is_highest_alignment else 'latest')} checkpoint at epoch {epoch + 1} to {save_path}"
+        )
+
+    def _preview_checkpoint_for_resuming(self, checkpoint_path: str):
+        """
+        Loads minimal info (epoch, best_val_loss) from a checkpoint to preview
+        before deciding on a full resume.
+
+        :param checkpoint_path: Path to the checkpoint file.
+        :return: (wandb_run, start_epoch, best_val_loss, best_epoch) tuple of checkpoint info.
+        """
+        if not os.path.isfile(checkpoint_path):
+            print(f"Warning: checkpoint not found at {checkpoint_path}.")
+            return None, 0, float("inf"), -1
+
+        print(f"[Preview] Loading minimal info from checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+        wandb_run = checkpoint.get("wandb_run", None)
+        start_epoch = checkpoint.get("epoch", -1) + 1
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        best_epoch = checkpoint.get("best_epoch", -1)
+
+        print(
+            f"[Preview] Found run_id={wandb_run}, start_epoch={start_epoch}, "
+            f"best_val_loss={best_val_loss}, best_epoch={best_epoch}"
+        )
+        return wandb_run, start_epoch, best_val_loss, best_epoch
+
+    def _load_full_checkpoint(self, checkpoint_path: str, device, training_setup):
+        """
+        Loads a full checkpoint including encoders, optimizer, and scheduler states.
+
+        :param checkpoint_path: Path to the checkpoint file.
+        :param device: Device on which to map the checkpoint.
+        :param training_setup: Dict containing model/optimizer references, e.g.
+          {
+            "video_encoder": self.video_encoder,
+            "text_encoder": self.text_encoder,
+            "optimizer": self.optimizer,
+            "scheduler": self.lr_scheduler
+          }
+        :return: None. Modifies models/optimizer in-place.
+        """
+        if not os.path.isfile(checkpoint_path):
+            print(f"Warning: checkpoint not found at {checkpoint_path}. No loading done.")
+            return
+
+        print(f"[Full Load] Loading checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+        video_encoder = training_setup["video_encoder"]
+        text_encoder = training_setup["text_encoder"]
+        optimizer = training_setup["optimizer"]
+        scheduler = training_setup["scheduler"]
+
+        if "video_encoder" in checkpoint:
+            video_encoder.load_state_dict(checkpoint["video_encoder"], strict=False)
+        if "text_encoder" in checkpoint:
+            text_encoder.load_state_dict(checkpoint["text_encoder"], strict=False)
+
+        if "optimizer" in checkpoint and checkpoint["optimizer"]:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint and checkpoint["scheduler"] and scheduler is not None:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+
+    def _preprocess_inputs(self, batch: dict) -> tuple[dict, list[str]]:
+        """
+        Moves raw batch data (videos, texts) to GPU and returns a dictionary suitable
+        for the model step, along with a list of paths or IDs for each sample.
+
+        :param batch: Dictionary containing 'videos', 'encoded_texts', and 'paths'.
+        :return: (step_inputs, paths_or_sids)
+        """
+        videos_tensor = batch["videos"].to(self.device).float()
+        torch.nan_to_num_(videos_tensor, nan=0.0, posinf=0.0, neginf=0.0)
+
+        step_inputs: Dict[str, Any] = {"videos": videos_tensor}
+
+        encoded_texts = batch.get("encoded_texts")
+        if encoded_texts is not None:
+            step_inputs["input_ids"] = encoded_texts["input_ids"].to(self.device)
+            step_inputs["attention_mask"] = encoded_texts["attention_mask"].to(self.device)
+
+        positive_mask = batch.get("positive_mask")
+        if positive_mask is not None:
+            step_inputs["positive_mask"] = positive_mask.to(self.device).float()
+        positive_weights = batch.get("positive_weights")
+        if positive_weights is not None:
+            step_inputs["positive_weights"] = positive_weights.to(self.device).float()
+
+        if "text_ids" in batch:
+            step_inputs["text_ids"] = batch["text_ids"]
+        if "text_metadata" in batch:
+            step_inputs["text_metadata"] = batch["text_metadata"]
+
+        return step_inputs, batch.get("paths", [])
+
+    def _train_step(
+        self,
+        videos: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        positive_mask: Optional[torch.Tensor] = None,
+        positive_weights: Optional[torch.Tensor] = None,
+        text_ids: Optional[List[str]] = None,
+        text_metadata: Optional[List[Dict[str, Any]]] = None,
+        debug_sample_info: Optional[List[Dict[str, Any]]] = None,
+        **_: Any,
+    ) -> tuple[dict, dict]:
+        if self.step % self.config.gradient_accumulation_steps == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        amp_device_type = resolve_inference_device(self.device).type
+        amp_enabled: bool = self.scaler is not None and amp_device_type == "cuda"
+        autocast_ctx: torch.amp.autocast = torch.amp.autocast(
+            device_type=amp_device_type,
+            enabled=amp_enabled,
+        )
+
+        with autocast_ctx:
+            video_emb = self.video_encoder(videos)
+            if input_ids is not None and attention_mask is not None:
+                text_emb = self.text_encoder(input_ids, attention_mask)
+            else:
+                text_emb = None
+
+        video_emb = torch.nan_to_num(video_emb, nan=0.0, posinf=1e4, neginf=-1e4)
+        if text_emb is not None:
+            text_emb = torch.nan_to_num(text_emb, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        if not torch.isfinite(video_emb).all() or (text_emb is not None and not torch.isfinite(text_emb).all()):
+            if self.config.is_ref_device:
+                print("Warning: non-finite embeddings detected; sanitising to zeros")
+            video_emb = torch.zeros_like(video_emb)
+            if text_emb is not None:
+                text_emb = torch.zeros_like(text_emb)
+
+        video_emb = video_emb.float()
+        if text_emb is not None:
+            text_emb = text_emb.float()
+
+        logits_matrix = None
+        pos_weights_for_loss = None
+        alignment_logprob_tensor: Optional[torch.Tensor] = None
+        alignment_prob_tensor: Optional[torch.Tensor] = None
+        alignment_cosine_tensor: Optional[torch.Tensor] = None
+        if positive_mask is not None and text_emb is not None:
+            expected_shape = (video_emb.size(0), text_emb.size(0))
+            if tuple(positive_mask.shape) != expected_shape:
+                raise ValueError(
+                    f"positive_mask shape {tuple(positive_mask.shape)} does not "
+                    f"match (video_emb, text_emb) = {expected_shape}"
+                )
+            targets = positive_mask
+            video_norm = F.normalize(video_emb, dim=1)
+            text_norm = F.normalize(text_emb, dim=1)
+            similarity = torch.matmul(video_norm, text_norm.t())
+            gated = similarity * torch.sigmoid(similarity)
+            temp_value = torch.exp(self.log_temp.float())
+            logits_matrix = gated / temp_value
+
+            if self.siglip_abnormal_margin > 0 and text_metadata:
+                abnormal_vector = logits_matrix.new_tensor(
+                    [
+                        1.0 if (meta and meta.get("is_abnormal", False)) else 0.0
+                        for meta in text_metadata
+                    ]
+                )
+                if torch.count_nonzero(abnormal_vector) > 0:
+                    logits_matrix = logits_matrix + abnormal_vector.unsqueeze(0) * self.siglip_abnormal_margin
+
+            if self.use_weighted_siglip and self.weighted_siglip_loss is not None:
+                pos_weights_for_loss = targets
+                if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                    pos_weights_for_loss = targets * positive_weights
+                clip_loss = self.weighted_siglip_loss(
+                    logits=logits_matrix,
+                    positive_weights=pos_weights_for_loss,
+                )
+            else:
+                negative_weight = getattr(self.config, 'siglip_negative_weight', 1.0)
+                weight_matrix = torch.full_like(targets, negative_weight)
+                if positive_weights is not None:
+                    weight_matrix = torch.where(targets > 0, positive_weights, weight_matrix)
+
+                loss_sum = F.binary_cross_entropy_with_logits(
+                    logits_matrix,
+                    targets,
+                    weight=weight_matrix,
+                    reduction='sum'
+                )
+                denom = max(1.0, float(targets.sum().item()))
+                clip_loss = loss_sum / denom
+
+            with torch.no_grad():
+                logprob_matrix = F.log_softmax(logits_matrix, dim=1)
+                pos_weight_mask = None
+                if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                    pos_weight_mask = positive_weights * targets
+                else:
+                    pos_weight_mask = targets
+                row_sums = pos_weight_mask.sum(dim=1)
+                valid_rows = row_sums > 0
+                if valid_rows.any():
+                    normalized_weights = torch.zeros_like(pos_weight_mask)
+                    normalized_weights[valid_rows] = pos_weight_mask[valid_rows] / row_sums[valid_rows].unsqueeze(1)
+                    alignment_logprob_tensor = (logprob_matrix * normalized_weights).sum(dim=1)[valid_rows].mean()
+                    alignment_prob_tensor = alignment_logprob_tensor.exp()
+                pos_logits = similarity[targets.bool()]
+                if pos_logits.numel() > 0:
+                    alignment_cosine_tensor = pos_logits.mean()
+        else:
+            with autocast_ctx:
+                clip_loss = self.loss_fn.run(
+                    video_features=video_emb,
+                    text_features=text_emb,
+                    log_temp=self.log_temp,
+                )
+            if text_emb is not None:
+                video_norm = F.normalize(video_emb, dim=1)
+                text_norm = F.normalize(text_emb, dim=1)
+                similarity = torch.matmul(video_norm, text_norm.t())
+                alignment_cosine_tensor = torch.diag(similarity).mean()
+                use_siglip = "siglip" in str(getattr(self.config, "loss_name", "")).lower()
+                logits_base = similarity
+                if use_siglip:
+                    logits_base = similarity * torch.sigmoid(similarity)
+                tau_value = torch.exp(self.log_temp.float())
+                logits_matrix = logits_base / tau_value
+                logprob_matrix = F.log_softmax(logits_matrix, dim=1)
+                alignment_logprob_tensor = torch.diag(logprob_matrix).mean()
+                alignment_prob_tensor = alignment_logprob_tensor.exp()
+
+        debug_enabled = self.config.is_ref_device and self._should_debug_batch()
+        debug_payload: Dict[str, Any] = {}
+        if debug_enabled:
+            with torch.no_grad():
+                if positive_mask is not None and text_emb is not None and logits_matrix is not None:
+                    pos_logits = logits_matrix[positive_mask.bool()]
+                    neg_logits = logits_matrix[~positive_mask.bool()]
+                    debug_payload.update(
+                        {
+                            'pos_logit_mean': float(pos_logits.mean().item()) if pos_logits.numel() > 0 else 0.0,
+                            'pos_logit_std': float(pos_logits.std(unbiased=False).item()) if pos_logits.numel() > 1 else 0.0,
+                            'neg_logit_mean': float(neg_logits.mean().item()) if neg_logits.numel() > 0 else 0.0,
+                            'neg_logit_std': float(neg_logits.std(unbiased=False).item()) if neg_logits.numel() > 1 else 0.0,
+                            'clip_loss': float(clip_loss.detach().item()),
+                            'temperature': float(torch.exp(self.log_temp.float()).item()),
+                            'batch_size': int(video_emb.size(0)),
+                        }
+                    )
+                    if positive_weights is not None:
+                        pos_weight_vals = positive_weights[positive_mask.bool()]
+                        if pos_weight_vals.numel() > 0:
+                            debug_payload.update(
+                                {
+                                    'pos_weight_mean': float(pos_weight_vals.mean().item()),
+                                    'pos_weight_min': float(pos_weight_vals.min().item()),
+                                    'pos_weight_max': float(pos_weight_vals.max().item()),
+                                }
+                            )
+                    debug_payload['neg_weight'] = float(getattr(self.config, 'siglip_negative_weight', 1.0))
+                else:
+                    sim_matrix = torch.matmul(
+                        F.normalize(video_emb.float(), dim=1),
+                        F.normalize(text_emb.float(), dim=1).t(),
+                    )
+                    diag = torch.diag(sim_matrix)
+                    off_diag = sim_matrix - torch.diag(diag)
+                    debug_payload.update({
+                        'diag_mean': float(diag.mean().item()),
+                        'diag_std': float(diag.std(unbiased=False).item()),
+                        'off_diag_mean': float(off_diag.mean().item()),
+                        'off_diag_std': float(off_diag.std(unbiased=False).item()),
+                        'clip_loss': float(clip_loss.detach().item()),
+                        'temperature': float(torch.exp(self.log_temp.float()).item()),
+                        'batch_size': int(video_emb.size(0)),
+                    })
+                if debug_sample_info:
+                    debug_payload['samples'] = debug_sample_info
+
+        total_loss = clip_loss
+
+        scaled_loss = total_loss / self.config.gradient_accumulation_steps
+
+        if amp_enabled:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        max_norm = getattr(self.config, "max_grad_norm", 5.0)
+        grad_norms: Dict[str, float] = {}
+        should_log_gradients = False
+
+        if max_norm and (self.step + 1) % self.config.gradient_accumulation_steps == 0:
+            params = itertools.chain(
+                self.video_encoder.parameters(),
+                self.text_encoder.parameters(),
+            )
+            if amp_enabled:
+                self.scaler.unscale_(self.optimizer)
+            clip_grad_norm_(params, max_norm=max_norm)
+            if debug_enabled:
+                grad_norms = self._collect_grad_norms(self.optimizer.param_groups)
+
+        if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
+            if (
+                isinstance(self.log_temp, torch.nn.Parameter)
+                and self.log_temp.grad is not None
+                and torch.distributed.is_initialized()
+            ):
+                torch.distributed.all_reduce(self.log_temp.grad, op=torch.distributed.ReduceOp.AVG)
+
+            if amp_enabled:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
+            if self.lr_scheduler and self.scheduler_per_iteration and self.step > 0:
+                self.lr_scheduler.step()
+
+            if debug_enabled:
+                lr_snapshot = {
+                    group.get('name', f'group_{idx}'): group['lr']
+                    for idx, group in enumerate(self.optimizer.param_groups)
+                }
+                video_params = list(self.video_encoder.module.parameters()) if hasattr(self.video_encoder, 'module') else list(self.video_encoder.parameters())
+                text_params = list(self.text_encoder.module.parameters()) if hasattr(self.text_encoder, 'module') else list(self.text_encoder.parameters())
+                video_with_grad = sum(1 for p in video_params if p.grad is not None)
+                text_with_grad = sum(1 for p in text_params if p.grad is not None)
+                extra_counts = {
+                    'video_params_with_grad': video_with_grad,
+                    'text_params_with_grad': text_with_grad,
+                    'video_params_total': len(video_params),
+                    'text_params_total': len(text_params),
+                }
+                grad_payload = {
+                    'grad_norms': grad_norms,
+                    'lr': lr_snapshot,
+                }
+                if debug_sample_info:
+                    grad_payload['samples'] = debug_sample_info
+                grad_payload.update(extra_counts)
+                msg = {
+                    'step': int(self.step),
+                    **debug_payload,
+                    **grad_payload,
+                }
+                print(f"[SigLIP DEBUG] {msg}")
+
+
+        self.step += 1
+
+        if self.config.is_ref_device and self.wandb_wrapper.is_initialized():
+            log_gradient_norms(
+                model=self.video_encoder,
+                wandb_wrapper=self.wandb_wrapper,
+                prefix="train/video_encoder/",
+            )
+            log_gradient_norms(
+                model=self.text_encoder,
+                wandb_wrapper=self.wandb_wrapper,
+                prefix="train/text_encoder/",
+            )
+
+        with torch.no_grad():
+            video_fp32 = video_emb.float()
+            if text_emb is not None:
+                text_fp32 = text_emb.float()
+                embedding_norms = compute_embedding_norms(video_fp32, text_fp32)
+                if positive_mask is not None:
+                    if alignment_cosine_tensor is None:
+                        video_norm = F.normalize(video_fp32, dim=1)
+                        text_norm = F.normalize(text_fp32, dim=1)
+                        cos_matrix = torch.matmul(video_norm, text_norm.t())
+                        pos_cos = cos_matrix[positive_mask.bool()]
+                        if pos_cos.numel() > 0:
+                            alignment_cosine_tensor = pos_cos.mean()
+                    if alignment_prob_tensor is None and logits_matrix is not None:
+                        logprob_matrix = F.log_softmax(logits_matrix.detach(), dim=1)
+                        if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                            pos_weight_mask = positive_weights * positive_mask
+                        else:
+                            pos_weight_mask = positive_mask
+                        row_sums = pos_weight_mask.sum(dim=1)
+                        valid_rows = row_sums > 0
+                        if valid_rows.any():
+                            normalized_weights = torch.zeros_like(pos_weight_mask)
+                            normalized_weights[valid_rows] = pos_weight_mask[valid_rows] / row_sums[valid_rows].unsqueeze(1)
+                            alignment_logprob_tensor = (logprob_matrix * normalized_weights).sum(dim=1)[valid_rows].mean()
+                            alignment_prob_tensor = alignment_logprob_tensor.exp()
+                else:
+                    if alignment_cosine_tensor is None:
+                        video_norm = F.normalize(video_fp32, dim=1)
+                        text_norm = F.normalize(text_fp32, dim=1)
+                        similarity = torch.matmul(video_norm, text_norm.t())
+                        alignment_cosine_tensor = torch.diag(similarity).mean()
+                    if alignment_prob_tensor is None and logits_matrix is not None:
+                        logprob_matrix = F.log_softmax(logits_matrix.detach(), dim=1)
+                        alignment_logprob_tensor = torch.diag(logprob_matrix).mean()
+                        alignment_prob_tensor = alignment_logprob_tensor.exp()
+            else:
+                text_fp32 = torch.empty(0, device=video_fp32.device)
+                embedding_norms = {}
+
+        lr_metrics = {
+            f"lr/{pg.get('name', str(i))}": pg["lr"]
+            for i, pg in enumerate(self.optimizer.param_groups)
+        }
+
+        alignment_score_scalar: float
+        batch_metrics = {
+            "loss": total_loss.detach().item(),
+            "temperature": self.log_temp.exp().detach().item(),
+            "contrastive/clip_loss": clip_loss.detach().item(),
+            **embedding_norms,
+            **lr_metrics,
+        }
+        if alignment_prob_tensor is not None:
+            batch_metrics["alignment_score"] = float(alignment_prob_tensor.detach().item())
+            batch_metrics["alignment_logprob"] = float(alignment_logprob_tensor.detach().item())
+        else:
+            alignment_score_scalar = float(alignment_cosine_tensor.detach().item()) if alignment_cosine_tensor is not None else 0.0
+            batch_metrics["alignment_score"] = alignment_score_scalar
+        if alignment_cosine_tensor is not None:
+            batch_metrics["alignment_cosine"] = float(alignment_cosine_tensor.detach().item())
+
+        embeddings = {
+            "video_embeddings": video_fp32,
+            "text_embeddings": text_fp32,
+        }
+
+        return batch_metrics, embeddings
+
+    def _val_step(
+        self,
+        videos: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        positive_mask: Optional[torch.Tensor] = None,
+        positive_weights: Optional[torch.Tensor] = None,
+        text_ids: Optional[List[str]] = None,
+        text_metadata: Optional[List[Dict[str, Any]]] = None,
+        debug_sample_info: Optional[List[Dict[str, Any]]] = None,
+        **_: Any,
+    ) -> tuple[dict, dict]:
+        """
+        Performs a single validation step (forward pass + metric computation).
+
+        :param videos: Tensor of shape [B, num_clips, T, H, W, C].
+        :param input_ids: Encoded text token IDs.
+        :param attention_mask: Attention mask for text.
+        :return: (batch_metrics, embeddings) similar to _train_step, but without backprop.
+        """
+        alignment_logprob_tensor: Optional[torch.Tensor] = None
+        alignment_prob_tensor: Optional[torch.Tensor] = None
+        alignment_cosine_tensor: Optional[torch.Tensor] = None
+        amp_device_type = resolve_inference_device(self.device).type
+        amp_enabled = amp_device_type == "cuda" and bool(
+            getattr(self.config, "use_amp", self.scaler is not None)
+        )
+        with torch.no_grad():
+            with torch.amp.autocast(device_type=amp_device_type, enabled=amp_enabled):
+                video_features = self.video_encoder(videos)
+                if input_ids is not None and attention_mask is not None:
+                    text_features = self.text_encoder(input_ids, attention_mask)
+                else:
+                    text_features = None
+
+            video_features = torch.nan_to_num(video_features, nan=0.0, posinf=1e4, neginf=-1e4)
+            if text_features is not None:
+                text_features = torch.nan_to_num(text_features, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            if not torch.isfinite(video_features).all() or (text_features is not None and not torch.isfinite(text_features).all()):
+                if self.config.is_ref_device:
+                    print("Warning: non-finite validation embeddings detected; sanitising to zeros")
+                video_features = torch.zeros_like(video_features)
+                if text_features is not None:
+                    text_features = torch.zeros_like(text_features)
+
+            video_features = video_features.float()
+            if text_features is not None:
+                text_features = text_features.float()
+
+            logits_matrix = None
+            if positive_mask is not None and text_features is not None:
+                expected_shape = (video_features.size(0), text_features.size(0))
+                if tuple(positive_mask.shape) != expected_shape:
+                    raise ValueError(
+                        f"positive_mask shape {tuple(positive_mask.shape)} does not "
+                        f"match (video_features, text_features) = {expected_shape}"
+                    )
+                targets = positive_mask
+                video_norm = F.normalize(video_features, dim=1)
+                text_norm = F.normalize(text_features, dim=1)
+                similarity = torch.matmul(video_norm, text_norm.t())
+                gated = similarity * torch.sigmoid(similarity)
+                temp_value = torch.exp(self.log_temp.float())
+                logits_matrix = gated / temp_value
+
+                if self.siglip_abnormal_margin > 0 and text_metadata:
+                    abnormal_vector = logits_matrix.new_tensor(
+                        [
+                            1.0 if (meta and meta.get("is_abnormal", False)) else 0.0
+                            for meta in text_metadata
+                        ]
+                    )
+                    if torch.count_nonzero(abnormal_vector) > 0:
+                        logits_matrix = logits_matrix + abnormal_vector.unsqueeze(0) * self.siglip_abnormal_margin
+
+                if self.use_weighted_siglip and self.weighted_siglip_loss is not None:
+                    pos_weights = targets
+                    if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                        pos_weights = targets * positive_weights
+                    loss = self.weighted_siglip_loss(
+                        logits=logits_matrix,
+                        positive_weights=pos_weights,
+                    )
+                else:
+                    negative_weight = getattr(self.config, 'siglip_negative_weight', 1.0)
+                    weight_matrix = torch.full_like(targets, negative_weight)
+                    if positive_weights is not None:
+                        weight_matrix = torch.where(targets > 0, positive_weights, weight_matrix)
+                    loss_sum = F.binary_cross_entropy_with_logits(
+                        logits_matrix,
+                        targets,
+                        weight=weight_matrix,
+                        reduction='sum'
+                    )
+                    denom = max(1.0, float(targets.sum().item()))
+                    loss = loss_sum / denom
+
+                logprob_matrix = F.log_softmax(logits_matrix, dim=1)
+                if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                    pos_weight_mask = positive_weights * targets
+                else:
+                    pos_weight_mask = targets
+                row_sums = pos_weight_mask.sum(dim=1)
+                valid_rows = row_sums > 0
+                if valid_rows.any():
+                    normalized_weights = torch.zeros_like(pos_weight_mask)
+                    normalized_weights[valid_rows] = pos_weight_mask[valid_rows] / row_sums[valid_rows].unsqueeze(1)
+                    alignment_logprob_tensor = (logprob_matrix * normalized_weights).sum(dim=1)[valid_rows].mean()
+                    alignment_prob_tensor = alignment_logprob_tensor.exp()
+
+                pos_cos = similarity[targets.bool()]
+                if pos_cos.numel() > 0:
+                    alignment_cosine_tensor = pos_cos.mean()
+            else:
+                loss = self.loss_fn.run(
+                    video_features=video_features,
+                    text_features=text_features,
+                    log_temp=self.log_temp,
+                )
+                if text_features is not None:
+                    video_norm = F.normalize(video_features, dim=1)
+                    text_norm = F.normalize(text_features, dim=1)
+                    similarity = torch.matmul(video_norm, text_norm.t())
+                    alignment_cosine_tensor = torch.diag(similarity).mean()
+                    use_siglip = "siglip" in str(getattr(self.config, "loss_name", "")).lower()
+                    logits_base = similarity
+                    if use_siglip:
+                        logits_base = similarity * torch.sigmoid(similarity)
+                    tau_value = torch.exp(self.log_temp.float())
+                    logits_matrix = logits_base / tau_value
+                    logprob_matrix = F.log_softmax(logits_matrix, dim=1)
+                    alignment_logprob_tensor = torch.diag(logprob_matrix).mean()
+                    alignment_prob_tensor = alignment_logprob_tensor.exp()
+
+            video_fp32 = video_features.float()
+            if text_features is not None:
+                text_fp32 = text_features.float()
+                embedding_norms = compute_embedding_norms(video_fp32, text_fp32)
+                if positive_mask is not None:
+                    if alignment_cosine_tensor is None:
+                        video_norm = F.normalize(video_fp32, dim=1)
+                        text_norm = F.normalize(text_fp32, dim=1)
+                        cos_matrix = torch.matmul(video_norm, text_norm.t())
+                        pos_cos = cos_matrix[positive_mask.bool()]
+                        if pos_cos.numel() > 0:
+                            alignment_cosine_tensor = pos_cos.mean()
+                    if alignment_prob_tensor is None and logits_matrix is not None:
+                        logprob_matrix = F.log_softmax(logits_matrix.detach(), dim=1)
+                        if positive_weights is not None and torch.count_nonzero(positive_weights) > 0:
+                            pos_weight_mask = positive_weights * positive_mask
+                        else:
+                            pos_weight_mask = positive_mask
+                        row_sums = pos_weight_mask.sum(dim=1)
+                        valid_rows = row_sums > 0
+                        if valid_rows.any():
+                            normalized_weights = torch.zeros_like(pos_weight_mask)
+                            normalized_weights[valid_rows] = pos_weight_mask[valid_rows] / row_sums[valid_rows].unsqueeze(1)
+                            alignment_logprob_tensor = (logprob_matrix * normalized_weights).sum(dim=1)[valid_rows].mean()
+                            alignment_prob_tensor = alignment_logprob_tensor.exp()
+                else:
+                    if alignment_cosine_tensor is None:
+                        video_norm = F.normalize(video_fp32, dim=1)
+                        text_norm = F.normalize(text_fp32, dim=1)
+                        similarity = torch.matmul(video_norm, text_norm.t())
+                        alignment_cosine_tensor = torch.diag(similarity).mean()
+                    if alignment_prob_tensor is None and logits_matrix is not None:
+                        logprob_matrix = F.log_softmax(logits_matrix.detach(), dim=1)
+                        alignment_logprob_tensor = torch.diag(logprob_matrix).mean()
+                        alignment_prob_tensor = alignment_logprob_tensor.exp()
+            else:
+                text_fp32 = torch.empty(0, device=video_fp32.device)
+                embedding_norms = {}
+
+        metrics: Dict[str, float] = {}
+        if alignment_prob_tensor is not None:
+            metrics["alignment_score"] = float(alignment_prob_tensor.detach().item())
+            metrics["alignment_logprob"] = float(alignment_logprob_tensor.detach().item())
+        else:
+            metrics["alignment_score"] = float(alignment_cosine_tensor.detach().item()) if alignment_cosine_tensor is not None else 0.0
+        if alignment_cosine_tensor is not None:
+            metrics["alignment_cosine"] = float(alignment_cosine_tensor.detach().item())
+        metrics.update(embedding_norms)
+
+        return (
+            {
+                "loss": torch.nan_to_num(loss, nan=0.0).detach().item(),
+                "temperature": self.log_temp.exp().detach().item(),
+                **metrics,
+            },
+            {
+                "video_embeddings": video_fp32,
+                "text_embeddings": text_fp32,
+            },
+        )
+
+    def validate(self):
+        """Run a dedicated validation epoch."""
+        return self._run_epoch(mode=RunMode.VALIDATE, epoch=0)
+
+    def inference(self):
+        """Run retrieval-style metadata inference with the video encoder."""
+        return run_retrieval_metadata_inference(
+            video_encoder=self.video_encoder,
+            val_loader=self.val_loader,
+            config=self.config,
+            device_id=self.device,
+            world_size=self.world_size,
+            output_dir=self.output_dir,
+        )

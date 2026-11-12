@@ -1,0 +1,95 @@
+command:
+  - torchrun
+  - "--nproc_per_node=2"
+  - "--master_port=29500"
+  - "scripts/main.py"
+  - "--base_config"
+  - "config/clip/base_config.yaml"
+  - ${args}
+
+name: "dev_deep_coro_clip"
+project: "dev_deep_coro_clip"
+entity: "mhi_ai"
+
+method: bayes
+
+metric:
+  name: best_val_loss
+  goal: minimize
+
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 5e-5
+    max: 1e-3
+    
+  multi_video:
+    values: [true]
+
+  optimizer:
+    values: ["RAdam", "AdamW"]
+
+  scheduler_name:
+    values: ["step", "cosine"]
+
+  lr_step_period:
+    values: [15, 20, 30]
+
+  factor:
+    distribution: uniform
+    min: 0.2
+    max: 0.5
+
+  dropout:
+    distribution: uniform
+    min: 0.1
+    max: 0.2
+
+  video_freeze_ratio:
+    distribution: uniform
+    min: 0.8
+    max: 0.95
+
+  stride:
+    values: [1, 2, 3]
+  
+  frames:
+    values: [32, 64]
+
+  text_freeze_ratio:
+    distribution: uniform
+    min: 0.7
+    max: 0.95
+
+  num_heads:
+    values: [2, 4, 8, 16]
+
+  aggregator_depth:
+    values: [1, 2, 4]
+
+  temperature:
+    distribution: uniform
+    min: 0.05
+    max: 0.1
+
+  video_weight_decay:
+    distribution: log_uniform_values
+    min: 1e-7
+    max: 1e-4
+  text_weight_decay:
+    distribution: log_uniform_values
+    min: 1e-7
+    max: 1e-6
+
+  batch_size:
+    values: [16, 24]
+  num_videos:
+    values: [2, 3, 4]
+  loss_name:  
+    values: ["contrastive_ddp","siglip_ddp"]
+
+early_terminate:
+  type: hyperband
+  min_iter: 5
+  eta: 3
+  s: 3

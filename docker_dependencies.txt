@@ -1,0 +1,5 @@
+opencv-python
+scikit-image
+stam_pytorch
+timesformer_pytorch
+torchmetrics

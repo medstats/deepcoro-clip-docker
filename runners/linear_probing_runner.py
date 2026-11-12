@@ -1,0 +1,1422 @@
+import os
+import json
+import torch
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional, Dict,  Callable
+
+from tqdm import tqdm
+from torch.optim import Optimizer
+from torch.amp import GradScaler
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LRScheduler
+from collections import defaultdict
+
+from utils.metrics import (
+    compute_regression_metrics,
+    compute_binary_classification_metrics, 
+    compute_multiclass_classification_metrics
+)
+from utils.loss.typing import Loss
+from utils.ddp import DistributedUtils
+from utils.registry import RunnerRegistry
+from utils.enums import RunMode, MetricTask
+from utils.wandb_wrapper import WandbWrapper
+from utils.config.linear_probing_config import LinearProbingConfig
+
+# Type aliases Definitions
+ProcessedBatch = Dict[str, torch.Tensor]
+StepFnResults = Dict[str, Dict[str, torch.Tensor]]
+
+@dataclass
+class BatchResult:
+    outputs: StepFnResults
+    processed_batch: ProcessedBatch
+    
+
+@RunnerRegistry.register("DeepCORO_video_linear_probing")
+@RunnerRegistry.register("DeepCORO_video_linear_probing_test")
+@RunnerRegistry.register("DeepCORO_video_linear_probing_cardio_syntax")
+class LinearProbingRunner:
+    """
+    This class runs a linear probing pipeline using a VideoEncoder and TextEncoder.
+    It handles both training and validation loops in a distributed data-parallel setting.
+    """
+    def __init__(
+        self,
+        loss_fn: Loss,
+        output_dir: str,
+        val_loader: DataLoader,
+        config: LinearProbingConfig,
+        wandb_wrapper: WandbWrapper,
+        linear_probing,
+        scaler: Optional[GradScaler] = None,
+        optimizer: Optional[Optimizer] = None,
+        train_loader: Optional[DataLoader] = None,
+        lr_scheduler: Optional[LRScheduler] = None
+    ):
+        """
+        Initialize the runner with provided configurations, data loaders, and modules.
+
+        :param config: LinearProbingConfig object with run/training configuration.
+        :param wandb_wrapper: WandbWrapper instance.
+        :param train_loader: DataLoader for training dataset.
+        :param val_loader: DataLoader for validation dataset.
+        :param linear_probing: LinearProbing model.
+        :param optimizer: optimizer instance.
+        :param scaler: GradScaler for automatic mixed precision.
+        :param scheduler: Learning rate scheduler.
+        :param loss_fn: Contrastive loss function callable.
+        :param output_dir: Directory where checkpoints and outputs will be saved.
+        """
+        self.config: LinearProbingConfig = config
+        self.wandb_wrapper: WandbWrapper = wandb_wrapper
+        self.world_size: int = config.world_size
+        self.device: int = config.device
+        self.train_loader: DataLoader = train_loader
+        self.val_loader: DataLoader = val_loader
+        self.linear_probing = linear_probing  # VideoMILWrapper
+        self.optimizer: Optimizer = optimizer
+        self.scaler: GradScaler = scaler
+        self.lr_scheduler: LRScheduler = lr_scheduler
+        self.loss_fn: Loss = loss_fn
+        self.output_dir: str = output_dir
+        # Embedding capture for PCI analysis
+        self._captured_embeddings = []
+        self._embedding_hook_handle = None
+
+        self.best_val_loss = float("inf")
+        self.best_epoch = -1
+        # For simplicity: check the config for a known scheduler_name
+        # If it includes "_warmup" or is from HF, we treat it as per-iteration
+        self.scheduler_per_iteration = self._scheduler_is_per_iteration()
+        self.step = 0
+
+    def _scheduler_is_per_iteration(self) -> bool:
+        """
+        Returns True if the chosen scheduler is a Hugging Face style that
+        expects a call to .step() per iteration (batch). Otherwise, False.
+        """
+        # We do a simpler check to change scheduler update to per epoch or per batch:
+        # Example keywords: "linear_warmup", "cosine_with_warmup", 
+        # "cosine_with_hard_restarts_with_warmup", etc.
+        sched_name = getattr(self.config, "scheduler_name", "").lower()
+        # If it matches typical HF warmup schedulers, return True
+        HF_KEYS = ["warmup", "with_warmup"]
+        return any(k in sched_name for k in HF_KEYS)
+
+    def train(
+        self, 
+        start_epoch: int, 
+        end_epoch: int
+    ) -> None:
+        for epoch in range(start_epoch, end_epoch):
+            # Synchronize before epoch starts
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )            
+            
+            # Training phase
+            train_metrics = self._run_epoch(
+                mode=RunMode.TRAIN, 
+                epoch=epoch
+            )   
+            if self.wandb_wrapper.is_initialized() and self.config.is_ref_device:
+                # Let wandb auto-increment steps
+                self.wandb_wrapper.log(train_metrics)
+                print(f"[DEBUG] rank={self.device} => Logged train metrics to W&B")
+            
+            # Sync before validation
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )
+            
+            # Validation phase
+            val_metrics = self._run_epoch(
+                mode=RunMode.VALIDATE, 
+                epoch=epoch
+            )
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )
+            
+            # Update best model
+            if val_metrics["val/main_loss"] < self.best_val_loss:
+                prev_best = self.best_val_loss
+                self.best_val_loss = val_metrics["val/main_loss"]
+                self.best_epoch = epoch
+                if self.config.is_ref_device:
+                    print(
+                        f"\nNew best model! Val Loss: {val_metrics['val/main_loss']:.4f} "
+                        f"(previous: {prev_best:.4f})"
+                    )
+                    self._save_checkpoint(
+                        epoch=epoch,
+                        metrics={
+                            **train_metrics, 
+                            **val_metrics
+                        },
+                        is_best=True,
+                    )
+
+            # Always save "latest" checkpoint
+            if self.config.is_ref_device:
+                self._save_checkpoint(
+                    epoch=epoch,
+                    metrics={**train_metrics, **val_metrics},
+                    is_best=False,
+                )
+            
+            # Sync after validation
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )
+            
+            if self.lr_scheduler and (not self.scheduler_per_iteration):
+                self.lr_scheduler.step()
+                
+            if self.wandb_wrapper.is_initialized() and self.config.is_ref_device:
+                val_metrics['best_val_loss'] = self.best_val_loss
+                print(f"[DEBUG] rank={self.device} => Val metrics: {val_metrics}")
+                self.wandb_wrapper.log(val_metrics)
+                print(f"[DEBUG] rank={self.device} => Logged val metrics to W&B")  
+                
+            # Sync after logging
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )                                 
+
+            # ------------------------------------------------------------------
+            # Memory cleanup to avoid GPU OOM across epochs
+            # ------------------------------------------------------------------
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
+    def _run_epoch(
+        self, 
+        mode: str, 
+        epoch: int
+    ) -> dict[str, float]:
+        assert mode in [RunMode.TRAIN, RunMode.VALIDATE]
+        
+        self.linear_probing.train(mode == RunMode.TRAIN)
+
+        epoch_metrics: dict[str, float] = {}
+
+        dataloader: DataLoader = self.train_loader if mode == RunMode.TRAIN else self.val_loader
+        step_fn: Callable[..., StepFnResults] = self._train_step if mode == RunMode.TRAIN else self._val_step
+
+        tqdm_desc: str = f"[GPU {self.device}] Running {mode} Epoch {epoch + 1}"
+        if self.config.is_ref_device:
+            data_iter: tqdm = tqdm(dataloader, desc=tqdm_desc)
+        else:
+            data_iter: DataLoader = dataloader
+        
+        gathered_metrics: Dict[str, float] = {}
+        accumulated_preds: Dict[str, list[torch.Tensor]] = defaultdict(list)
+        accumulated_targets: Dict[str, list[torch.Tensor]] = defaultdict(list)
+        accumulated_names: list[str] = []
+        
+        for batch_idx, batch in enumerate(data_iter, start=1):
+            try:
+                run_batch: BatchResult = self._run_batch(
+                    batch=batch,
+                    step_fn=step_fn
+                )
+
+                # Accumulate batch metrics for each head
+                self._accumulate_batch_metrics(
+                    run_batch=run_batch,
+                    accumulated_preds=accumulated_preds,
+                    accumulated_targets=accumulated_targets,
+                    accumulated_names=accumulated_names,
+                    gathered_metrics=gathered_metrics,
+                    batch=batch
+                )
+                
+            except Exception as e:
+                raise Exception(f"[DEBUG] rank={self.device} => Error in step_fn: {e}")
+            
+            # Note: lr_scheduler.step() for per_iteration schedulers is handled in _train_step()
+            # after optimizer.step() to maintain the correct PyTorch 1.1.0+ order
+
+            # Update progress bar with gathered losses
+            if self.config.is_ref_device:
+                data_iter.set_postfix({
+                    f"{k}": f'{(v / batch_idx):.4f}' if 'mean' in k else f'{v:.4f}' 
+                    for k, v in gathered_metrics.items()
+                })
+            
+            # Sync after each batch
+            DistributedUtils.sync_process_group(
+                world_size=self.world_size,
+                device_ids=self.device
+            )
+
+        # Gather all predictions and targets across GPUs if using distributed training
+        self._gather_distributed_predictions(
+            accumulated_preds=accumulated_preds,
+            accumulated_targets=accumulated_targets,
+            accumulated_names=accumulated_names
+        )
+
+        # Sync after gathering predictions and targets
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+
+        # Gather losses across GPUs if using distributed training
+        if self.config.world_size > 1:
+            # Convert accumulated losses to the format expected by gather_loss
+            for k, v in gathered_metrics.items():
+                if 'mean_' in k:
+                    # Convert accumulated loss sum to a list and gather across GPUs
+                    gathered_loss_sum = DistributedUtils.gather_loss([v], self.config.device)
+                    # Compute average using total batches across all GPUs
+                    epoch_metrics[f"{mode}/{k.replace('mean_', '')}_loss"] = gathered_loss_sum / batch_idx
+        else:
+            # Single GPU - compute averages normally
+            for k, v in gathered_metrics.items():
+                if 'mean' in k:
+                    epoch_metrics[f"{mode}/{k.replace('mean_', '')}_loss"] = v / batch_idx
+        
+        # Compute AUC metrics for each head
+        if self.config.is_ref_device:
+            self._compute_heads_metrics(
+                mode=mode,
+                accumulated_preds=accumulated_preds,
+                accumulated_targets=accumulated_targets,
+                validation_metrics=epoch_metrics,
+                compute_ci=False
+            )
+            
+        # Sync after computing heads metrics
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+
+        if self.config.is_ref_device:
+            print(f"[DEBUG] rank={self.device} => {mode} epoch metrics: {epoch_metrics}")
+
+        # Save predictions for validation mode
+        if mode == RunMode.VALIDATE and self.config.is_ref_device:
+            print(f"[DEBUG] rank={self.device} => Saving predictions for validation mode")
+            self._save_predictions(
+                mode=mode,
+                epoch=epoch,
+                accumulated_names=accumulated_names,
+                accumulated_preds=accumulated_preds,
+                accumulated_targets=accumulated_targets,
+            )
+
+        # ------------------------------------------------------------------
+        # Memory cleanup: delete large local variables & free GPU cache
+        # ------------------------------------------------------------------
+        import gc
+
+        # Explicitly delete variables that exist in scope
+        variables_to_delete = [
+            'accumulated_preds',
+            'accumulated_targets',
+            'preds',
+            'targets',
+            'outputs',
+            'losses',
+        ]
+
+        for var_name in variables_to_delete:
+            if var_name in locals():
+                del locals()[var_name]
+        
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        return epoch_metrics
+
+    def _preprocess_inputs(
+        self, 
+        batch: Dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Preprocess batch inputs for the model.
+        
+        Args:
+            batch: Dictionary containing:
+                videos: Tensor of shape [B, num_videos, F, H, W, C] for shaped
+                       multi-video batches, [B * num_videos, F, H, W, C] for
+                       flat multi-video batches, or [B, F, H, W, C] for
+                       single-video batches
+                targets: Dict of tensors [B, ...]
+                video_indices: Optional tensor [B * num_videos] mapping videos to batch indices
+                video_mask: Optional tensor [B, num_videos] marking real videos
+                video_fname: List of file paths
+                
+        Returns:
+            Dictionary containing processed tensors ready for model input
+        """
+        # Move videos to device
+        batch_video = batch['videos'].to(self.config.device)
+
+        # Move targets to device
+        batch_targets = batch['targets']
+        for k, v in batch_targets.items():
+            batch_targets[k] = v.to(self.config.device)
+
+        # Move view_ids to device if present (EchoJEPA-style angle embeddings)
+        view_ids = batch.get('view_ids', None)
+        if view_ids is not None:
+            view_ids = view_ids.to(self.config.device)
+
+        video_mask = batch.get('video_mask', None)
+        if video_mask is not None:
+            video_mask = video_mask.to(self.config.device, dtype=torch.bool)
+
+        video_indices = batch.get('video_indices', None)
+        if video_indices is not None:
+            video_indices = video_indices.to(self.config.device, dtype=torch.long)
+
+        return {
+            "batch_video": batch_video,
+            "batch_targets": batch_targets,
+            "video_indices": video_indices,
+            "video_mask": video_mask,
+            "view_ids": view_ids,
+        }
+    
+    def _run_batch(
+        self,
+        batch: Dict[str, torch.Tensor],
+        step_fn: Callable[..., StepFnResults],
+    ) -> BatchResult:
+        processed_batch: ProcessedBatch = self._preprocess_inputs(batch)
+        outputs: StepFnResults = step_fn(**processed_batch)
+        
+        return BatchResult(
+            outputs=outputs,
+            processed_batch=processed_batch
+        )
+
+    def _optimizer_parameters_with_grad(self) -> list[torch.nn.Parameter]:
+        if self.optimizer is None:
+            return []
+
+        return [
+            p
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+            if p.grad is not None
+        ]
+
+    def _step_optimizer(self) -> bool:
+        if self.optimizer is None:
+            return False
+
+        max_grad_norm = float(getattr(self.config, "max_grad_norm", 0.0) or 0.0)
+        if self.scaler:
+            scale_before_step = self.scaler.get_scale()
+            if max_grad_norm > 0:
+                self.scaler.unscale_(self.optimizer)
+                params = self._optimizer_parameters_with_grad()
+                if params:
+                    torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            return self.scaler.get_scale() >= scale_before_step
+
+        if max_grad_norm > 0:
+            params = self._optimizer_parameters_with_grad()
+            if params:
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+        self.optimizer.step()
+        return True
+    
+    def _train_step(
+        self,
+        batch_video: torch.Tensor,
+        batch_targets: Dict[str, torch.Tensor],
+        video_indices: torch.Tensor = None,
+        video_mask: torch.Tensor = None,
+        view_ids: torch.Tensor = None,
+    ) -> StepFnResults:
+        # Clear gradients only if this is the first step in accumulation
+        if self.step % self.config.gradient_accumulation_steps == 0:
+            if self.optimizer is not None:
+                self.optimizer.zero_grad()
+
+        # Forward pass with autocast for mixed precision only on CUDA.
+        amp_device_type = batch_video.device.type
+        amp_enabled = bool(self.config.use_amp and amp_device_type == "cuda")
+        with torch.amp.autocast(
+            device_type=amp_device_type,
+            enabled=amp_enabled,
+            dtype=torch.float16,
+        ):
+            try:
+                if amp_enabled:
+                    batch_video = batch_video.to(dtype=torch.float16)
+
+                outputs_dict: dict[str, torch.Tensor] = self.linear_probing(
+                    batch_video,
+                    video_indices=video_indices,
+                    video_mask=video_mask,
+                    view_ids=view_ids,
+                )
+            except Exception as e:
+                raise Exception(f"[DEBUG] rank={self.device} => Error in linear_probing: {e} for batch with video shape {batch_video.shape}")
+
+        try:
+            if amp_enabled:
+                for head_name, target in batch_targets.items():
+                    if self.config.head_task[head_name] == MetricTask.REGRESSION:
+                        batch_targets[head_name] = target.to(dtype=torch.float16)
+                    # For classification tasks, keep targets as integers (long)
+                    # No conversion needed as they should remain as long for loss functions
+            
+            losses: dict[str, torch.Tensor] = self.loss_fn.run(
+                outputs=outputs_dict, 
+                targets=batch_targets
+            )
+        except Exception as e:
+            raise Exception(f"[DEBUG] rank={self.device} => Error in loss_fn: {e} for batch with outputs_dict {outputs_dict} and batch_targets {batch_targets}")
+
+        # Scale loss by gradient accumulation steps
+        scaled_loss = losses['main'] / self.config.gradient_accumulation_steps
+
+        # Non-finite-loss guard: a single corrupt batch (e.g. AMP fp16 overflow)
+        # must not poison the weights with NaN/Inf. If the loss is non-finite,
+        # drop any pending grads and skip backward/step for this batch.
+        if not bool(torch.isfinite(scaled_loss).all().item()):
+            print(
+                f"[WARN] rank={self.device} non-finite loss "
+                f"({scaled_loss.detach().float().item()}) at step {self.step}; "
+                "skipping backward/optimizer step for this batch"
+            )
+            if self.optimizer is not None:
+                self.optimizer.zero_grad(set_to_none=True)
+        else:
+            # Backward pass with gradient scaling
+            if self.scaler:
+                self.scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+
+            # Sync gradients across processes before optimizer step
+            DistributedUtils.sync_process_group(
+                world_size=self.config.world_size,
+                device_ids=self.config.device
+            )
+
+            # Only step optimizer and update scaler if this is the last step in accumulation
+            if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
+                did_optimizer_step = self._step_optimizer()
+
+                # Step the learning rate scheduler after optimizer step
+                if did_optimizer_step and self.lr_scheduler and self.scheduler_per_iteration:
+                    self.lr_scheduler.step()
+
+        # Increment step counter
+        self.step += 1
+
+        # Get learning rate metrics
+        lr_metrics = {}
+        if self.optimizer is not None:
+            for pg in self.optimizer.param_groups:
+                lr_metrics[f"lr/{pg['name']}"] = pg["lr"]
+
+        # Convert losses to scalar values
+        scalar_losses = {k: v.item() for k, v in losses.items()}
+        scalar_outputs = {k: v.detach() for k, v in outputs_dict.items()}
+
+        return {
+            "losses": scalar_losses,
+            "logits": scalar_outputs,
+            **lr_metrics
+        }
+        
+    def _val_step(
+        self,
+        batch_video: torch.Tensor,
+        batch_targets: Dict[str, torch.Tensor],
+        video_indices: torch.Tensor = None,
+        video_mask: torch.Tensor = None,
+        view_ids: torch.Tensor = None,
+    ) -> StepFnResults:
+        # Forward pass with autocast for mixed precision
+        with torch.no_grad():
+            try:
+                # Convert inputs to float16 if AMP is enabled
+                if self.config.use_amp:
+                    batch_video = batch_video.to(dtype=torch.float16)
+
+                outputs_dict: dict[str, torch.Tensor] = self.linear_probing(
+                    batch_video,
+                    video_indices=video_indices,
+                    video_mask=video_mask,
+                    view_ids=view_ids,
+                )
+            except Exception as e:
+                raise Exception(f"[DEBUG] rank={self.device} => Error in linear_probing: {e} for batch with video shape {batch_video.shape}")
+
+        try:
+            # Only convert regression targets to float16 if AMP is enabled, keep classification targets as integers
+            if self.config.use_amp:
+                for head_name, target in batch_targets.items():
+                    if self.config.head_task[head_name] == MetricTask.REGRESSION:
+                        batch_targets[head_name] = target.to(dtype=torch.float16)
+                    # For classification tasks, keep targets as integers (long)
+                    # No conversion needed as they should remain as long for loss functions
+            
+            losses: dict[str, torch.Tensor] = self.loss_fn.run(
+                outputs=outputs_dict, 
+                targets=batch_targets
+            )
+        except Exception as e:
+            raise Exception(f"[DEBUG] rank={self.device} => Error in loss_fn: {e} for batch with outputs shape {outputs_dict} and targets shape {batch_targets}")
+                
+        # Sync gradients across processes before optimizer step
+        DistributedUtils.sync_process_group(
+            world_size=self.config.world_size,
+            device_ids=self.config.device
+        )
+
+        # Get learning rate metrics
+        lr_metrics = {}
+        if self.optimizer is not None:
+            for pg in self.optimizer.param_groups:
+                lr_metrics[f"lr/{pg['name']}"] = pg["lr"]
+
+        # Convert losses to scalar values
+        scalar_losses = {k: v.item() for k, v in losses.items()}
+        scalar_outputs = {k: v.detach() for k, v in outputs_dict.items()}
+                
+        return {
+            "losses": scalar_losses,
+            "logits": scalar_outputs,
+            **lr_metrics
+        }
+
+    def _inference_step(
+        self,
+        batch_video: torch.Tensor,
+        batch_targets: Dict[str, torch.Tensor],  # Unused - parsed to match signature
+        video_indices: torch.Tensor = None,
+        video_mask: torch.Tensor = None,
+        view_ids: torch.Tensor = None,
+    ) -> StepFnResults:
+        # Forward pass with autocast for mixed precision
+        with torch.no_grad():
+            try:
+                # Convert inputs to float16 if AMP is enabled
+                if self.config.use_amp:
+                    batch_video = batch_video.to(dtype=torch.float16)
+
+                outputs_dict: dict[str, torch.Tensor] = self.linear_probing(
+                    batch_video,
+                    video_indices=video_indices,
+                    video_mask=video_mask,
+                    view_ids=view_ids,
+                )
+            except Exception as e:
+                raise Exception(f"[DEBUG] rank={self.device} => Error in linear_probing: {e} for batch with video shape {batch_video.shape}")
+  
+        # Sync gradients across processes before optimizer step
+        DistributedUtils.sync_process_group(
+            world_size=self.config.world_size,
+            device_ids=self.config.device
+        )
+
+        # Convert losses to scalar values
+        scalar_outputs = {k: v.detach() for k, v in outputs_dict.items()}
+                
+        return {
+            "logits": scalar_outputs
+        }
+
+    def validate(self) -> None:
+        """
+        Run validation on the validation dataset and return metrics with confidence intervals.
+        
+        Returns:
+            Dictionary containing computed metrics for all heads with CIs
+        """
+        # Set model to evaluation mode
+        assert len(self.val_loader) > 0, "Validation loader is empty"
+        
+        self.linear_probing.train(False)
+        
+        # Setup embedding capture for PCI analysis
+        self._setup_embedding_capture()
+        
+        # Define compute_ci flag
+        compute_ci: bool = False
+        
+        # Synchronize before inference starts
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+        
+        # Initialize metrics and accumulation containers
+        validation_metrics: Dict[str, float] = {}
+        accumulated_preds: Dict[str, list[torch.Tensor]] = defaultdict(list)
+        accumulated_targets: Dict[str, list[torch.Tensor]] = defaultdict(list)
+        accumulated_names: list[str] = []
+        gathered_metrics: Dict[str, float] = {}
+        
+        # Set up progress bar
+        tqdm_desc: str = f"[GPU {self.device}] Running Validation"
+        if self.config.is_ref_device:
+            data_iter: tqdm = tqdm(self.val_loader, desc=tqdm_desc, total=len(self.val_loader))
+        else:
+            data_iter = self.val_loader
+        
+        step_fn: Callable[..., StepFnResults] = self._val_step
+        
+        # Process all batches
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(data_iter, start=1):
+                try:
+                    # Forward pass
+                    run_batch: BatchResult = self._run_batch(
+                        batch=batch,
+                        step_fn=step_fn
+                    )
+                    
+                    # Accumulate batch metrics for each head
+                    self._accumulate_batch_metrics(
+                        run_batch=run_batch,
+                        accumulated_preds=accumulated_preds,
+                        accumulated_targets=accumulated_targets,
+                        accumulated_names=accumulated_names,
+                        gathered_metrics=gathered_metrics,
+                        batch=batch
+                    )
+                    
+                except Exception as e:
+                    raise Exception(f"[DEBUG] rank={self.device} => Error in validation step: {e}")
+                
+                # Update progress bar with gathered losses
+                if self.config.is_ref_device:
+                    data_iter.set_postfix({
+                        f"{k}": f'{(v / (batch_idx)):.4f}' if 'mean' in k else f'{v:.4f}' 
+                        for k, v in gathered_metrics.items()
+                    })
+                
+                # Sync after each batch
+                DistributedUtils.sync_process_group(
+                    world_size=self.world_size,
+                    device_ids=self.device
+                )
+        
+        # Gather all predictions and targets across GPUs if using distributed training
+        self._gather_distributed_predictions(
+            accumulated_preds=accumulated_preds,
+            accumulated_targets=accumulated_targets,
+            accumulated_names=accumulated_names
+        )
+            
+        # Compute metrics for each head WITH CONFIDENCE INTERVALS
+        if self.config.is_ref_device:
+            print(f"[DEBUG] rank={self.device} => "
+                  f"{'Computing metrics with CI - This might take a while...' if compute_ci else 'Computing metrics without CI'}")
+            self._compute_heads_metrics(
+                mode=self.config.run_mode,
+                accumulated_preds=accumulated_preds,
+                accumulated_targets=accumulated_targets,
+                validation_metrics=validation_metrics,
+                compute_ci=compute_ci
+            )
+            
+        
+        # Save predictions if on reference device
+        if self.config.is_ref_device:
+            self._save_predictions(
+                mode=self.config.run_mode,
+                accumulated_names=accumulated_names,
+                accumulated_preds=accumulated_preds,
+                accumulated_targets=accumulated_targets,
+                epoch=-1  # Use -1 to indicate inference mode
+            )
+        
+        # Log metrics to wandb if available
+        if self.wandb_wrapper.is_initialized() and self.config.is_ref_device:
+            self.wandb_wrapper.log(validation_metrics)
+            print(f"[DEBUG] rank={self.device} => Logged validation metrics to W&B")
+        
+        # print(f"[DEBUG] rank={self.device} => Validation metrics: {validation_metrics}")
+        
+        # Final sync
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+        
+        # Save validation metrics with CI to JSON file
+        if self.config.is_ref_device and compute_ci:                
+            self._save_validation_metrics_to_json(validation_metrics)
+        
+        # Memory cleanup for GPU tensors
+        torch.cuda.empty_cache()
+        
+    def test(self) -> None:
+        """
+        Run test on the test dataset and return metrics with confidence intervals.
+        """
+        self.validate()
+    
+
+    def _setup_embedding_capture(self):
+        """Setup hook to capture pooled embeddings before classification heads."""
+        self._captured_embeddings = []
+        
+        def capture_hook(module, input, output):
+            # input[0] is the pooled embedding [B, D] or [B, 2*D] for hybrid
+            if isinstance(input, tuple):
+                emb = input[0].detach().cpu()
+            else:
+                emb = input.detach().cpu()
+            self._captured_embeddings.append(emb)
+        
+        # Hook into the first classification head to capture its input
+        # Handle DDP wrapping
+        model = self.linear_probing.module if hasattr(self.linear_probing, 'module') else self.linear_probing
+        first_head_name = list(model.mil_model.heads.keys())[0]
+        first_head = model.mil_model.heads[first_head_name]
+        self._embedding_hook_handle = first_head.register_forward_hook(capture_hook)
+        print(f"[INFO] Embedding capture hook registered on head '{first_head_name}'")
+
+    def _remove_embedding_capture(self):
+        """Remove the embedding capture hook."""
+        if self._embedding_hook_handle is not None:
+            self._embedding_hook_handle.remove()
+            self._embedding_hook_handle = None
+
+    def _save_embeddings(
+        self,
+        accumulated_names: list,
+        output_path: str,
+    ) -> None:
+        """Save captured embeddings to a file."""
+        if not self._captured_embeddings:
+            print("[WARNING] No embeddings captured to save")
+            return
+        
+        # Concatenate all embeddings
+        embeddings_tensor = torch.cat(self._captured_embeddings, dim=0)
+        
+        # Save as torch file
+        save_dict = {
+            'study_ids': accumulated_names,
+            'embeddings': embeddings_tensor,
+            'embedding_dim': embeddings_tensor.shape[1],
+        }
+        
+        torch.save(save_dict, output_path)
+        print(f"[INFO] Saved {len(accumulated_names)} embeddings to {output_path}")
+        print(f"[INFO] Embedding shape: {embeddings_tensor.shape}")
+        
+        # Clear captured embeddings
+        self._captured_embeddings = []
+
+    def inference(self) -> None:
+        """
+        Run inference on the test dataset and return metrics.
+        """
+        assert len(self.val_loader) > 0, "Test loader is empty"
+        
+        self.linear_probing.train(False)
+        
+        # Setup embedding capture for PCI analysis
+        self._setup_embedding_capture()
+        
+        # Synchronize before inference starts
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+        
+        # Initialize metrics and accumulation containers
+        accumulated_preds: Dict[str, list[torch.Tensor]] = defaultdict(list)
+        accumulated_names: list[str] = []
+        
+        # Set up progress bar
+        tqdm_desc: str = f"[GPU {self.device}] Running Inference"
+        if self.config.is_ref_device:
+            data_iter: tqdm = tqdm(self.val_loader, desc=tqdm_desc, total=len(self.val_loader))
+        else:
+            data_iter = self.val_loader
+        
+        step_fn: Callable[..., StepFnResults] = self._inference_step
+        
+        # Process all batches
+        with torch.no_grad():
+            for _, batch in enumerate(data_iter, start=1):
+                    # Forward pass
+                    run_batch: BatchResult = self._run_batch(
+                        batch=batch,
+                        step_fn=step_fn
+                    )
+                    
+                    # Accumulate batch metrics for each head
+                    self._accumulate_batch_metrics_inference(
+                        run_batch=run_batch,
+                        accumulated_preds=accumulated_preds,
+                        accumulated_names=accumulated_names,
+                        batch=batch
+                    )
+
+        # Sync after inference
+        DistributedUtils.sync_process_group(
+            world_size=self.world_size,
+            device_ids=self.device
+        )
+
+        # Gather all predictions across GPUs if using distributed training
+        self._gather_distributed_predictions(
+            accumulated_preds=accumulated_preds,
+            accumulated_names=accumulated_names,
+            accumulated_targets=None
+        )
+            
+        # Save predictions if on reference device
+        if self.config.is_ref_device:
+            self._save_predictions(
+                mode=self.config.run_mode,
+                epoch=-1,
+                accumulated_names=accumulated_names,
+                accumulated_preds=accumulated_preds,
+                accumulated_targets=None,
+            )
+            
+            # Save embeddings for PCI analysis
+            embeddings_path = os.path.join(self.output_dir, "predictions", "study_embeddings.pt")
+            self._save_embeddings(accumulated_names, embeddings_path)
+            self._remove_embedding_capture()
+
+    def _save_checkpoint(
+        self, 
+        epoch: int, 
+        metrics: dict[str, float], 
+        is_best: bool = False
+    ) -> None:
+        """
+        Saves model checkpoint (including model weights, optimizer, scheduler, and metrics).
+
+        :param epoch: Current epoch index.
+        :param metrics: Dictionary of metrics to be saved.
+        :param is_best: If True, saves as 'best_epoch.pt'. Otherwise, saves as 'checkpoint.pt'.
+        """
+        checkpoint_dir = os.path.join(self.output_dir, "models")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        checkpoint = {
+            "linear_probing": self.linear_probing.module.state_dict()
+            if hasattr(self.linear_probing, "module")
+            else self.linear_probing.state_dict(),
+            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
+            "scheduler": self.lr_scheduler.state_dict() if self.lr_scheduler else None,
+            "epoch": epoch,
+            "scaler": self.scaler.state_dict() if self.scaler else None,
+        }
+        
+        # Save regular checkpoint for current epoch
+        checkpoint_path: str = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+        torch.save(checkpoint, checkpoint_path)
+
+        # Delete the checkpoint from the previous epoch if it exists
+        if epoch > 0:
+            prev_checkpoint_path: str = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch - 1}.pt')
+            if os.path.exists(prev_checkpoint_path):
+                os.remove(prev_checkpoint_path)
+                print(f"Deleted old checkpoint: {prev_checkpoint_path}")
+        
+
+        # If this is the best model, save it separately
+        if is_best:
+            # Delete previous best model if it exists
+            for file in os.listdir(checkpoint_dir):
+                if file.startswith('best_model_epoch_') and file.endswith('.pt'):
+                    old_best_path = os.path.join(checkpoint_dir, file)
+                    if os.path.exists(old_best_path):
+                        os.remove(old_best_path)
+                        print(f"Deleted previous best model: {old_best_path}")
+            
+            best_model_path: str = os.path.join(checkpoint_dir, f'best_model_epoch_{epoch}.pt')
+            torch.save(checkpoint, best_model_path)
+            
+        if self.wandb_wrapper.is_initialized():
+            self.wandb_wrapper.log({
+                "checkpoint/epoch": epoch,
+                "checkpoint/loss": metrics["val/main_loss"],
+            })
+
+    def _save_predictions(
+        self,
+        mode: str,
+        epoch: int,
+        accumulated_names: list[str],
+        accumulated_preds: dict[str, torch.Tensor],
+        accumulated_targets: Optional[dict[str, torch.Tensor]] = None,
+    ) -> None:
+        """
+        Save model predictions and ground truth values to a CSV file.
+        Saves for every epoch and keeps best epoch predictions.
+        
+        Args:
+            mode: The current run mode (train/validation)
+            accumulated_names: List of video filenames
+            accumulated_targets: Dictionary of ground truth values for each head
+            epoch: Current epoch number
+        """
+        try:
+            # Create predictions dictionary with epoch column
+            predictions_dict: dict[str, list] = {
+                'epoch': [epoch] * len(accumulated_names),
+                'video_name': accumulated_names
+            }
+            
+            # Add predictions and ground truth for each head
+            for head in accumulated_preds.keys():
+                # Handle both tensor and list of tensors format
+                if isinstance(accumulated_preds[head], list):
+                    preds_tensor: torch.Tensor = accumulated_preds[head][0]
+                    targets_tensor: torch.Tensor = accumulated_targets[head][0] if accumulated_targets is not None else None
+                else:
+                    preds_tensor: torch.Tensor = accumulated_preds[head]
+                    targets_tensor: torch.Tensor = accumulated_targets[head] if accumulated_targets is not None else None
+                                                    
+                # Handle binary classification
+                if self.config.head_task[head] == MetricTask.BINARY_CLASSIFICATION:
+                    preds: np.ndarray = preds_tensor.squeeze().detach().cpu().float().numpy()
+                    targets: np.ndarray = targets_tensor.squeeze().detach().cpu().float().numpy() if targets_tensor is not None else None
+                    predictions_dict[f'{head}_pred'] = preds
+                    predictions_dict[f'{head}_true'] = targets
+                    
+                # Handle regression
+                elif self.config.head_task[head] == MetricTask.REGRESSION:
+                    preds: np.ndarray = preds_tensor.squeeze().detach().cpu().float().numpy()
+                    targets: np.ndarray = targets_tensor.squeeze().detach().cpu().float().numpy() if targets_tensor is not None else None
+                    predictions_dict[f'{head}_pred'] = preds
+                    predictions_dict[f'{head}_true'] = targets
+                    
+                # Handle multi-class classification
+                elif self.config.head_task[head] == MetricTask.MULTICLASS_CLASSIFICATION:                        
+                    # For multi-class, get both raw probabilities and predicted class
+                    pred_labels: np.ndarray = preds_tensor.squeeze().detach().cpu().float().numpy()
+                    target_labels: np.ndarray = targets_tensor.squeeze().detach().cpu().float().numpy() if targets_tensor is not None else None
+                    
+                    # Create index_to_label mapping
+                    index_to_label = {v: k for k, v in self.config.labels_map[head].items()}
+                    
+                    # Store probabilities for each class
+                    for class_idx in range(pred_labels.shape[1]):
+                        if hasattr(self.config, 'labels_map') and head in self.config.labels_map:
+                            label = f'{head}_prob_{index_to_label[class_idx]}'
+                        else:
+                            label = f'{head}_prob_{class_idx}'
+                        
+                        # Store probabilities for each class
+                        predictions_dict[label] = pred_labels[:, class_idx]    
+                        
+                    # Store predicted class
+                    predictions_dict[f'{head}_pred_class'] = pred_labels.argmax(axis=1)
+                    # Store true class
+                    predictions_dict[f'{head}_true_class'] = target_labels if target_labels is not None else None
+                    
+            # Create and save DataFrame
+            df: pd.DataFrame = pd.DataFrame(predictions_dict)
+            predictions_dir: str = os.path.join(self.output_dir, "predictions") 
+            os.makedirs(predictions_dir, exist_ok=True)
+            
+            # Save current epoch predictions
+            current_epoch_file: str = os.path.join(
+                predictions_dir, 
+                f'{mode}_predictions_epoch_{epoch}.csv'
+            )
+            df.to_csv(current_epoch_file, index=False)
+            print(f"[DEBUG] rank={self.device} => Saved epoch {epoch} predictions to {current_epoch_file}")
+            
+            # If this is the best epoch, also save as best predictions
+            if epoch == self.best_epoch:
+                best_file: str = os.path.join(
+                    predictions_dir, 
+                    f'{mode}_predictions_best_epoch_{epoch}.csv'
+                )
+                df.to_csv(best_file, index=False)
+                print(f"[DEBUG] rank={self.device} => Saved best epoch predictions to {best_file}")
+            
+        except Exception as e:
+            print(f"[DEBUG] rank={self.device} => Error saving predictions to CSV: {e}")
+            print(f"[DEBUG] rank={self.device} => Accumulated names length: {len(accumulated_names)}")
+            for head in accumulated_preds.keys():
+                print(f"[DEBUG] rank={self.device} => Head {head} - Final shapes:")
+                if isinstance(accumulated_preds[head], list):
+                    print(f"[DEBUG] rank={self.device} =>   Predictions: {accumulated_preds[head][0].shape}")
+                    if accumulated_targets is not None and head in accumulated_targets:
+                        print(f"[DEBUG] rank={self.device} =>   Targets: {accumulated_targets[head][0].shape}")
+                    else:
+                        print(f"[DEBUG] rank={self.device} =>   Targets: None (inference mode)")
+                else:
+                    print(f"[DEBUG] rank={self.device} =>   Predictions: {accumulated_preds[head].shape}")
+                    if accumulated_targets is not None and head in accumulated_targets:
+                        print(f"[DEBUG] rank={self.device} =>   Targets: {accumulated_targets[head].shape}")
+                    else:
+                        print(f"[DEBUG] rank={self.device} =>   Targets: None (inference mode)")
+            if 'predictions_dict' in locals():
+                print(f"[DEBUG] rank={self.device} => Predictions dictionary keys and lengths:")
+                for k, v in predictions_dict.items():
+                    print(f"[DEBUG] rank={self.device} =>   {k}: {len(v)}")
+
+    def _save_validation_metrics_to_json(self, validation_metrics: dict[str, float]) -> None:
+        """
+        Save validation metrics with confidence intervals to a JSON file.
+        
+        Args:
+            validation_metrics: Dictionary containing all validation metrics including CIs
+        """
+        def convert_to_serializable(obj):
+            """Convert numpy/torch types to Python native types for JSON serialization."""
+            if isinstance(obj, (np.integer, np.floating)):
+                return obj.item()
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif torch.is_tensor(obj):
+                return obj.detach().cpu().numpy().tolist() if obj.numel() > 1 else obj.item()
+            elif isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_serializable(v) for v in obj]
+            else:
+                return obj
+        
+        def organize_metrics_by_head(metrics: dict) -> dict:
+            """Organize flat metrics dictionary by head."""
+            organized = {}
+            
+            for head in self.config.head_structure.keys():
+                metric_values = {}
+                for metric_name, metric_value in metrics.items():  
+                    # More precise matching to avoid partial matches
+                    if f"/{head}_" in metric_name: 
+                        metric_name_filtered = metric_name.split("/")[-1].replace(f"{head}_", "")
+                        metric_values[metric_name_filtered] = metric_value  
+            
+                organized[head] = metric_values            
+            return organized
+        
+        try:
+            # Convert all metrics to JSON-serializable format
+            serializable_metrics = convert_to_serializable(validation_metrics)
+            
+            # Organize metrics by head
+            organized_metrics = organize_metrics_by_head(serializable_metrics)
+            
+            # Add metadata
+            metrics_with_metadata = {
+                "model_config": {
+                    "head_task": dict(self.config.head_task) if hasattr(self.config, 'head_task') else {},
+                    "ci_confidence_level": getattr(self.config, 'ci_confidence_level', 0.95),
+                    "ci_n_bootstrap": getattr(self.config, 'ci_n_bootstrap', 1000),
+                },
+                "metrics_by_head": organized_metrics,
+            }
+            
+            # Create metrics directory
+            metrics_dir = os.path.join(self.output_dir, "metrics")
+            os.makedirs(metrics_dir, exist_ok=True)
+            
+            # Save with timestamp
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            json_file = os.path.join(metrics_dir, f"validation_metrics_with_ci_{timestamp_str}.json")
+            
+            with open(json_file, 'w') as f:
+                json.dump(metrics_with_metadata, f, indent=2, ensure_ascii=False)
+            
+            print(f"[DEBUG] rank={self.device} => Saved validation metrics with CI to {json_file}")
+            
+            # Also save as latest (overwrites previous)
+            latest_json_file = os.path.join(metrics_dir, "validation_metrics_with_ci_latest.json")
+            with open(latest_json_file, 'w') as f:
+                json.dump(metrics_with_metadata, f, indent=2, ensure_ascii=False)
+            
+            print(f"[DEBUG] rank={self.device} => Saved latest validation metrics with CI to {latest_json_file}")
+                        
+        except Exception as e:
+            print(f"[DEBUG] rank={self.device} => Error saving validation metrics to JSON: {e}")
+
+    def _accumulate_batch_metrics(
+        self,
+        run_batch: BatchResult,
+        accumulated_preds: Dict[str, list[torch.Tensor]], # leverage ref. ptr to avoid reference return by Tuple
+        accumulated_targets: Dict[str, list[torch.Tensor]], # leverage ref. ptr to avoid reference return by Tuple
+        accumulated_names: list[str], # leverage ref. ptr to avoid reference return by Tuple
+        gathered_metrics: Dict[str, float], # leverage ref. ptr to avoid reference return by Tuple
+        batch: Dict[str, torch.Tensor]
+    ) -> None:
+        """
+        Accumulate metrics from a single batch for later computation.
+        
+        Args:
+            outputs: Model outputs containing losses, logits, and lr metrics
+            processed_batch: Preprocessed batch data
+            accumulated_preds: Dictionary to accumulate predictions for each head
+            accumulated_targets: Dictionary to accumulate targets for each head
+            accumulated_names: List to accumulate video names
+            gathered_metrics: Dictionary to accumulate scalar metrics
+            batch: Original batch data containing video filenames
+            
+        Note:
+            This function modifies the input containers in-place and returns None.            
+        """
+        # Accumulate metrics
+        for k, v in run_batch.outputs.items():
+            if k.startswith('lr/'):
+                # Learning rate metrics are already scalar values
+                gathered_metrics[k] = v
+            elif k == 'losses':
+                # Losses are already scalar values
+                for loss_name, loss_val in v.items():
+                    # Store current batch loss
+                    gathered_metrics[f"{loss_name}"] = loss_val
+                    
+                    # Accumulate sum for averaging over all batches
+                    if f'mean_{loss_name}' not in gathered_metrics:
+                        gathered_metrics[f'mean_{loss_name}'] = 0.0
+                    gathered_metrics[f'mean_{loss_name}'] += loss_val
+
+            elif k == 'logits':
+                # Handle logits for classification/regression metrics
+                for head_name, logits in v.items():
+                    # Get targets
+                    targets: torch.Tensor = run_batch.processed_batch['batch_targets'][head_name]
+                    
+                    # Get predictions based on task type
+                    if self.config.head_task[head_name] == MetricTask.BINARY_CLASSIFICATION:
+                        if logits.ndim != 2 or logits.shape[1] != 1:  # Expected shape: [B, 1]
+                            raise ValueError(
+                                f"[DEBUG] rank={self.device} => Binary classification head {head_name} "
+                                f"should have logits of shape [B, 1], but got {logits.shape}"
+                            )
+                        preds: torch.Tensor = torch.sigmoid(logits.float())
+                        # Keep as float to preserve NaN for masking; convert to long after filtering
+                        targets: torch.Tensor = targets.float()
+
+                    elif self.config.head_task[head_name] == MetricTask.MULTICLASS_CLASSIFICATION:
+                        if logits.ndim != 2 or logits.shape[1] < 2:  # Expected shape: [B, C] with C > 1
+                            raise ValueError(
+                                f"[DEBUG] rank={self.device} => Multiclass classification head {head_name} "
+                                f"should have logits of shape [B, C] where C > 1 (Nb of classes), but got {logits.shape}"
+                            )
+                        preds: torch.Tensor = torch.softmax(logits.float(), dim=1)
+                        # Keep as float to preserve NaN for masking; convert to long after filtering
+                        targets: torch.Tensor = targets.float()
+
+                    elif self.config.head_task[head_name] == MetricTask.REGRESSION:
+                        preds: torch.Tensor = logits
+                        targets: torch.Tensor = targets.float()
+                        
+                    else:
+                        raise ValueError(
+                            f"[DEBUG] rank={self.device} => Unknown head task: {self.config.head_task[head_name]} "
+                            f"Supported tasks: {', '.join([metric.value for metric in MetricTask])}"
+                        )
+                    
+                    # Accumulate predictions and targets
+                    accumulated_preds[head_name].append(preds)
+                    accumulated_targets[head_name].append(targets)
+        
+        # Accumulate video names
+        accumulated_names.extend(batch['video_fname'])
+
+    def _accumulate_batch_metrics_inference(
+        self,
+        run_batch: BatchResult,
+        accumulated_preds: Dict[str, list[torch.Tensor]], # leverage ref. ptr to avoid reference return by Tuple
+        accumulated_names: list[str], # leverage ref. ptr to avoid reference return by Tuple
+        batch: Dict[str, torch.Tensor]
+    ) -> None:
+        """
+        Accumulate metrics from a single batch for later computation.
+        
+        Args:
+            outputs: Model outputs containing losses, logits, and lr metrics
+            processed_batch: Preprocessed batch data
+            accumulated_preds: Dictionary to accumulate predictions for each head
+            accumulated_targets: Dictionary to accumulate targets for each head
+            accumulated_names: List to accumulate video names
+            gathered_metrics: Dictionary to accumulate scalar metrics
+            batch: Original batch data containing video filenames
+            
+        Note:
+            This function modifies the input containers in-place and returns None.            
+        """
+        # Accumulate metrics
+        for k, v in run_batch.outputs.items():
+            if k == 'logits':
+                # Handle logits for classification/regression metrics
+                for head_name, logits in v.items():                    
+                    # Get predictions based on task type
+                    if self.config.head_task[head_name] == MetricTask.BINARY_CLASSIFICATION:
+                        if logits.ndim != 2 or logits.shape[1] != 1:  # Expected shape: [B, 1]
+                            raise ValueError(
+                                f"[DEBUG] rank={self.device} => Binary classification head {head_name} "
+                                f"should have logits of shape [B, 1], but got {logits.shape}"
+                            )
+                        preds: torch.Tensor = torch.sigmoid(logits.float())
+                        
+                    elif self.config.head_task[head_name] == MetricTask.MULTICLASS_CLASSIFICATION:
+                        if logits.ndim != 2 or logits.shape[1] < 2:  # Expected shape: [B, C] with C > 1
+                            raise ValueError(
+                                f"[DEBUG] rank={self.device} => Multiclass classification head {head_name} "
+                                f"should have logits of shape [B, C] where C > 1 (Nb of classes), but got {logits.shape}"
+                            )
+                        preds: torch.Tensor = torch.softmax(logits.float(), dim=1)
+                        
+                    elif self.config.head_task[head_name] == MetricTask.REGRESSION:
+                        preds: torch.Tensor = logits
+                        
+                    else:
+                        raise ValueError(
+                            f"[DEBUG] rank={self.device} => Unknown head task: {self.config.head_task[head_name]} "
+                            f"Supported tasks: {', '.join([metric.value for metric in MetricTask])}"
+                        )
+                    
+                    # Accumulate predictions and targets
+                    accumulated_preds[head_name].append(preds)
+        
+        # Accumulate video names
+        accumulated_names.extend(batch['video_fname'])
+
+    def _gather_distributed_predictions(
+        self,
+        accumulated_names: list[str],
+        accumulated_preds: Dict[str, list[torch.Tensor]],
+        accumulated_targets: Optional[Dict[str, list[torch.Tensor]]] = None
+    ) -> None:
+        # Gather video names across all processes
+        gathered_names = DistributedUtils.gather_object(accumulated_names, self.config.world_size)
+        gathered_names_flat = [name for sublist in gathered_names for name in sublist]
+        
+        # Clear and update accumulated_names in-place
+        accumulated_names.clear()
+        accumulated_names.extend(gathered_names_flat)
+        
+        # Gather predictions and targets for each head
+        for head in accumulated_preds.keys():
+            # Convert lists to tensors (concatenate batches from this process)
+            local_preds: torch.Tensor = torch.cat(accumulated_preds[head], dim=0)
+            local_targets: torch.Tensor = torch.cat(accumulated_targets[head], dim=0) if accumulated_targets is not None else None
+            
+            # Gather tensors across all processes
+            gathered_preds: torch.Tensor = DistributedUtils.gather_tensor(local_preds, self.config.world_size)
+            gathered_targets: torch.Tensor = DistributedUtils.gather_tensor(local_targets, self.config.world_size) if accumulated_targets is not None else None
+            
+            # Update accumulated containers in-place
+            accumulated_preds[head] = [gathered_preds]
+            if accumulated_targets is not None:
+                accumulated_targets[head] = [gathered_targets]
+
+    def _compute_heads_metrics(
+        self,
+        mode: str,
+        accumulated_preds: Dict[str, list[torch.Tensor]],
+        accumulated_targets: Dict[str, list[torch.Tensor]],
+        validation_metrics: Dict[str, float], # leverage ref. ptr to avoid copying
+        compute_ci: bool = False
+    ) -> None:
+        """
+        Compute metrics for the given predictions and targets.
+        
+        Args:
+            accumulated_preds: Dictionary of predictions for each head
+            accumulated_targets: Dictionary of targets for each head
+            validation_metrics: Dictionary to accumulate validation metrics
+            
+        Note:
+            This function modifies the input validation_metrics dictionary in-place.
+        """
+        for head in tqdm(accumulated_preds.keys(), desc=f"Computing {mode} heads metrics {'with CI' if compute_ci else ''}", total=len(accumulated_preds)):
+            # Gather accumulated predictions and targets for each head
+            preds = torch.cat(accumulated_preds[head], dim=0)
+            targets = torch.cat(accumulated_targets[head], dim=0)
+
+            # Filter out NaN targets (missing data)
+            valid_mask = ~torch.isnan(targets)
+            n_valid = valid_mask.sum().item()
+            if n_valid < 2:
+                # Need at least 2 samples for meaningful metrics
+                continue
+            if not valid_mask.all():
+                preds = preds[valid_mask]
+                targets = targets[valid_mask]
+
+            # Convert targets to long for classification after NaN filtering
+            if self.config.head_task[head] in (MetricTask.BINARY_CLASSIFICATION, MetricTask.MULTICLASS_CLASSIFICATION):
+                targets = targets.long()
+
+            if self.config.head_task[head] == MetricTask.BINARY_CLASSIFICATION:
+                # Compute classification metrics WITH CI
+                head_metrics = compute_binary_classification_metrics(
+                    preds=preds.squeeze(-1) if preds.ndim == 2 else preds, # squeeze to remove the last dimension of the preds tensor - currently [B, 1] and expects [B,]
+                    targets=targets.squeeze(-1) if targets.ndim == 2 else targets, # squeeze to remove the last dimension of the targets tensor - currently [B, 1] and expects [B,]
+                    head_name=head,
+                    labels_map=self.config.labels_map,
+                    mode=mode, 
+                    wandb_wrapper=self.wandb_wrapper,
+                    is_ref_device=self.config.is_ref_device,
+                    confidence_level=getattr(self.config, 'ci_confidence_level', 0.95),
+                    n_bootstrap=getattr(self.config, 'ci_n_bootstrap', 1000),
+                    compute_ci=compute_ci
+                )
+            elif self.config.head_task[head] == MetricTask.MULTICLASS_CLASSIFICATION:
+                # Compute classification metrics WITH CI for multiclass
+                head_metrics = compute_multiclass_classification_metrics(
+                    preds=preds,
+                    targets=targets,
+                    head_name=head,
+                    labels_map=self.config.labels_map,
+                    mode=mode, 
+                    wandb_wrapper=self.wandb_wrapper,
+                    is_ref_device=self.config.is_ref_device,
+                    confidence_level=getattr(self.config, 'ci_confidence_level', 0.95),
+                    n_bootstrap=getattr(self.config, 'ci_n_bootstrap', 1000),
+                    compute_ci=compute_ci
+                )
+            elif self.config.head_task[head] == MetricTask.REGRESSION:
+                # Check if this regression head should also compute AUC
+                regression_auc_heads = getattr(self.config, 'regression_auc_heads', None) or {}
+                auc_threshold = regression_auc_heads.get(head, None)
+
+                # Compute regression metrics WITH CI
+                head_metrics = compute_regression_metrics(
+                    preds=preds,
+                    targets=targets,
+                    head_name=head,
+                    mode=mode,
+                    wandb_wrapper=self.wandb_wrapper,
+                    is_ref_device=self.config.is_ref_device,
+                    confidence_level=getattr(self.config, 'ci_confidence_level', 0.95),
+                    n_bootstrap=getattr(self.config, 'ci_n_bootstrap', 1000),
+                    compute_ci=compute_ci,
+                    auc_threshold=auc_threshold,
+                    labels_map=getattr(self.config, 'labels_map', None),
+                )
+            else:
+                raise ValueError(
+                    f"[DEBUG] rank={self.device} => Unknown head task: {self.config.head_task[head]} "
+                    f"Supported tasks: {', '.join([metric.value for metric in MetricTask])}"
+                )
+            
+            # Update inference metrics with computed metrics for the current head
+            for k, v in head_metrics.items():
+                validation_metrics[k] = v
